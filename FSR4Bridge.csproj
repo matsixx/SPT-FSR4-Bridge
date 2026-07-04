@@ -1,0 +1,87 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>netstandard2.1</TargetFramework>
+    <AssemblyName>FSR4Bridge</AssemblyName>
+    <RootNamespace>FSR4Bridge</RootNamespace>
+    <Nullable>disable</Nullable>
+    <Authors>matsix</Authors>
+    <AssemblyVersion>1.0.0</AssemblyVersion>
+    <FileVersion>$(AssemblyVersion)</FileVersion>
+    <Version>$(AssemblyVersion)</Version>
+    <LangVersion>latest</LangVersion>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <Configurations>Debug;Release</Configurations>
+    <Deterministic>true</Deterministic>
+  </PropertyGroup>
+
+  <PropertyGroup Condition=" '$(Configuration)' == 'Debug' ">
+    <DebugSymbols>true</DebugSymbols>
+    <DebugType>full</DebugType>
+    <Optimize>false</Optimize>
+    <OutputPath>bin\Debug\</OutputPath>
+    <DefineConstants>DEBUG;TRACE</DefineConstants>
+  </PropertyGroup>
+  <PropertyGroup Condition=" '$(Configuration)' == 'Release' ">
+    <DebugType>pdbonly</DebugType>
+    <Optimize>true</Optimize>
+    <OutputPath>bin\Release\</OutputPath>
+    <DefineConstants>TRACE</DefineConstants>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Reference Include="0Harmony">
+      <HintPath>F:\SPT4.0\BepInEx\core\0Harmony.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="BepInEx">
+      <HintPath>F:\SPT4.0\BepInEx\core\BepInEx.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="spt-reflection">
+      <HintPath>F:\SPT4.0\BepInEx\plugins\spt\spt-reflection.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="spt-common">
+      <HintPath>F:\SPT4.0\BepInEx\plugins\spt\spt-common.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <!-- Publicized copy (compile-time only) so we can read SSAAImpl / TemporalAntialiasing internals.
+         The game's real (non-publicized) DLL is what actually loads at runtime. -->
+    <Reference Include="Unity.Postprocessing.Runtime">
+      <HintPath>libs\Unity.Postprocessing.Runtime.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="UnityEngine">
+      <HintPath>F:\SPT4.0\EscapeFromTarkov_Data\Managed\UnityEngine.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="UnityEngine.CoreModule">
+      <HintPath>F:\SPT4.0\EscapeFromTarkov_Data\Managed\UnityEngine.CoreModule.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <!-- Publicized SPT-VR (compile-time only, soft dependency) for typed access to VRJitterComponent
+         when driving VR. The real SPT-VR.dll loads at runtime; flatscreen-only installs never touch
+         the VR-typed code path (NoInlining + SptVrPresent gate). -->
+    <Reference Include="SPT-VR">
+      <HintPath>libs\ModSupport\SPT-VR.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+
+  <!-- Auto-deploy: every build copies the managed DLL + the native bridge + AMD runtime straight into
+       the game, so the game always runs whatever was built last. Skipped when the game folder is
+       absent (e.g. building on another machine). -->
+  <Target Name="DeployToGame" AfterTargets="Build" Condition="Exists('F:\SPT4.0\BepInEx\plugins')">
+    <MakeDir Directories="F:\SPT4.0\BepInEx\plugins\FSR4Bridge\native" />
+    <Copy SourceFiles="$(TargetPath)" DestinationFolder="F:\SPT4.0\BepInEx\plugins\FSR4Bridge" />
+    <Copy SourceFiles="native\build\FSR4Native.dll"
+          DestinationFolder="F:\SPT4.0\BepInEx\plugins\FSR4Bridge\native"
+          Condition="Exists('native\build\FSR4Native.dll')" />
+    <Copy SourceFiles="native\runtime\amd_fidelityfx_loader_dx12.dll;native\runtime\amd_fidelityfx_upscaler_dx12.dll"
+          DestinationFolder="F:\SPT4.0\BepInEx\plugins\FSR4Bridge\native"
+          Condition="Exists('native\runtime\amd_fidelityfx_loader_dx12.dll')" />
+    <Message Importance="high" Text="==&gt; FSR4 Bridge deployed to F:\SPT4.0\BepInEx\plugins\FSR4Bridge" />
+  </Target>
+
+</Project>
