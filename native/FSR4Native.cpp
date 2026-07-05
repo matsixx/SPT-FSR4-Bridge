@@ -94,6 +94,11 @@ static void Log(const char* fmt, ...)
     OutputDebugStringA("\n");
 }
 
+// Verbose (per-texture / per-resize) diagnostics — OFF by default, toggled on by the "Debug Log" config.
+// Keeps the normal console to a couple of one-time lines instead of the shared-texture-churn spam.
+static std::atomic<bool> gVerbose{false};
+#define LogV(...) do { if (gVerbose.load()) Log(__VA_ARGS__); } while (0)
+
 static void LogW(const wchar_t* prefix, const wchar_t* msg)
 {
     char narrow[900];
@@ -382,7 +387,7 @@ static HRESULT CreateD3D12DeviceWithAgility(IDXGIAdapter* adapter)
             HRESULT hrd = factory->CreateDevice(adapter, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&g12));
             if (SUCCEEDED(hrd) && g12)
             {
-                Log("[FSR4] D3D12 device via Agility SDK v616 (SM 6.6 available for FSR4) — %s", coreDir);
+                LogV("[FSR4] D3D12 device via Agility SDK v616 (SM 6.6 available for FSR4) — %s", coreDir);
                 return S_OK;
             }
             Log("[FSR4] Agility CreateDevice failed (0x%08lX) — falling back to OS D3D12", hrd);
@@ -556,7 +561,7 @@ static void QueryVersionsOnce()
         const char* name = names[i] ? names[i] : "?";
         gVersionIds.push_back(ids[i]);
         gVersionNames.emplace_back(name);
-        Log("[FSR4] available upscaler version: %s (id 0x%016llX)", name, (unsigned long long)ids[i]);
+        LogV("[FSR4] available upscaler version: %s (id 0x%016llX)", name, (unsigned long long)ids[i]);
 
         // Providers report names beginning with the major version, e.g. "4.1.1" / "3.1.5" (maybe with
         // an "FSR " prefix). Track the highest 4.x (FSR4) and the highest 3.x (FSR 3.1.x) separately.
@@ -669,11 +674,11 @@ static bool CreateEyeContext(Eye& eye, UINT outW, UINT outH, int flags)
     if (SafeFfxQuery(&eye.ctx, &pv.header) == FFX_API_RETURN_OK && pv.versionName)
     {
         strncpy_s(gActiveVersionName, pv.versionName, _TRUNCATE);
-        Log("[FSR4] upscale context created: provider %s (out %ux%u, flags 0x%X)", pv.versionName, outW, outH, ffxFlags);
+        LogV("[FSR4] upscale context created: provider %s (out %ux%u, flags 0x%X)", pv.versionName, outW, outH, ffxFlags);
     }
     else
     {
-        Log("[FSR4] upscale context created (out %ux%u, flags 0x%X)", outW, outH, ffxFlags);
+        LogV("[FSR4] upscale context created (out %ux%u, flags 0x%X)", outW, outH, ffxFlags);
     }
 
     eye.ctxOutW = outW;
@@ -730,7 +735,7 @@ static bool EnsureSharedTex(SharedTex& st, ID3D11Texture2D* unityTex, bool needU
     st = SharedTex{};
 
     DXGI_FORMAT sharedFmt = CoerceTypedFormat(ud.Format);
-    Log("[FSR4] %s: unity desc %ux%u fmt %d (->%d) arraySize %u mips %u miscFlags 0x%X",
+    LogV("[FSR4] %s: unity desc %ux%u fmt %d (->%d) arraySize %u mips %u miscFlags 0x%X",
         label, ud.Width, ud.Height, ud.Format, sharedFmt, ud.ArraySize, ud.MipLevels, ud.MiscFlags);
 
     D3D12_HEAP_PROPERTIES heap = {};
@@ -763,7 +768,7 @@ static bool EnsureSharedTex(SharedTex& st, ID3D11Texture2D* unityTex, bool needU
                                                   D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&res12));
         if (FAILED(hr))
         {
-            Log("[FSR4] %s create[%s] failed 0x%08lX", label, c.name, hr);
+            LogV("[FSR4] %s create[%s] failed 0x%08lX", label, c.name, hr);
             continue;
         }
 
@@ -780,7 +785,7 @@ static bool EnsureSharedTex(SharedTex& st, ID3D11Texture2D* unityTex, bool needU
         CloseHandle(handle);
         if (FAILED(hr))
         {
-            Log("[FSR4] %s OpenSharedResource1[%s] failed 0x%08lX", label, c.name, hr);
+            LogV("[FSR4] %s OpenSharedResource1[%s] failed 0x%08lX", label, c.name, hr);
             continue;
         }
 
@@ -790,7 +795,7 @@ static bool EnsureSharedTex(SharedTex& st, ID3D11Texture2D* unityTex, bool needU
         st.width    = ud.Width;
         st.height   = ud.Height;
         st.format   = ud.Format;
-        Log("[FSR4] shared %s texture created via '%s': %ux%u fmt %d%s", label, c.name, ud.Width, ud.Height, sharedFmt, needUav ? " +UAV" : "");
+        LogV("[FSR4] shared %s texture created via '%s': %ux%u fmt %d%s", label, c.name, ud.Width, ud.Height, sharedFmt, needUav ? " +UAV" : "");
         return true;
     }
 
@@ -1006,7 +1011,7 @@ FSR4_EXPORT int Fsr4Init(const wchar_t* ffxDllDir)
         return gStatus;
     if (gStatus == FSR4_LOADER_MISSING || gStatus == FSR4_ENTRYPOINTS_MISSING)
         gStatus = FSR4_NOT_INITIALIZED;
-    Log("[FSR4] bridge initialized (ffx-api loaded)");
+    LogV("[FSR4] bridge initialized (ffx-api loaded)");
     return FSR4_OK;
 }
 
@@ -1033,7 +1038,7 @@ FSR4_EXPORT int Fsr4Preflight(void* anyUnityTexture, int flags)
         return gStatus.load();
     DestroyEyeContext(probe);
     gStatus = FSR4_OK;
-    Log("[FSR4] preflight OK — active provider: %s", gActiveVersionName);
+    LogV("[FSR4] preflight OK — active provider: %s", gActiveVersionName);
     return FSR4_OK;
 }
 
@@ -1100,6 +1105,11 @@ FSR4_EXPORT int Fsr4PopLogLine(char* buf, int cap)
 
 // Drops the FFX contexts + shared textures (devices stay). Call when the game tears the SSAA
 // pipeline down or the user turns the feature off; everything lazily rebuilds on next use.
+FSR4_EXPORT void Fsr4SetVerbose(int on)
+{
+    gVerbose.store(on != 0);
+}
+
 FSR4_EXPORT void Fsr4InvalidateContexts()
 {
     std::lock_guard<std::recursive_mutex> lock(gRenderMutex);

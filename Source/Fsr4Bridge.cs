@@ -50,6 +50,9 @@ namespace FSR4Bridge.Source
         private static bool _loggedActiveProvider;
         private static int _debugLogsLeft = 8;
         private static bool _prevDebugLog;
+        private static string _activeProviderStr = "FSR";
+        private static int _lastRW, _lastRH, _lastOW, _lastOH;
+        private static float _lastResLogTime = -999f;
 
         private static readonly int _camDepthTexId  = Shader.PropertyToID("_CameraDepthTexture");
         private static readonly int _camMotionTexId = Shader.PropertyToID("_CameraMotionVectorsTexture");
@@ -87,6 +90,9 @@ namespace FSR4Bridge.Source
         [DllImport(DLL, CallingConvention = CallingConvention.Cdecl)]
         private static extern void Fsr4InvalidateContexts();
 
+        [DllImport(DLL, CallingConvention = CallingConvention.Cdecl)]
+        private static extern void Fsr4SetVerbose(int on);
+
         [DllImport("kernel32", CharSet = CharSet.Unicode, SetLastError = true)]
         private static extern IntPtr LoadLibrary(string path);
 
@@ -115,6 +121,7 @@ namespace FSR4Bridge.Source
                     return false;
                 }
 
+                Fsr4SetVerbose(Fsr4Config.DebugLog.Value ? 1 : 0);   // route native spam through Debug Log (off by default)
                 int rc = Fsr4Init(nativeDir);
                 DrainLog();
                 if (rc != 0)
@@ -301,11 +308,14 @@ namespace FSR4Bridge.Source
             _cmd.IssuePluginEvent(_renderEventFunc, (slot << 1) | eye);
             UnityEngine.Graphics.ExecuteCommandBuffer(_cmd);
 
-            // Re-arm a fresh batch of logs each time Debug Log is toggled off→on (so you can pull logs
-            // again without a restart). % 89 (prime) so the sampling doesn't alias with the jitter period.
+            // Debug Log toggles both the managed per-frame diagnostics AND the native per-texture spam.
             bool dbg = Fsr4Config.DebugLog.Value;
-            if (dbg && !_prevDebugLog) _debugLogsLeft = 8;
-            _prevDebugLog = dbg;
+            if (dbg != _prevDebugLog)
+            {
+                if (dbg) _debugLogsLeft = 8;
+                Fsr4SetVerbose(dbg ? 1 : 0);
+                _prevDebugLog = dbg;
+            }
             if (dbg && _debugLogsLeft > 0 && (Time.frameCount % 89 == 0))
             {
                 _debugLogsLeft--;
@@ -322,9 +332,20 @@ namespace FSR4Bridge.Source
                 var sb = new StringBuilder(128);
                 if (Fsr4GetActiveVersion(sb, sb.Capacity) > 0 && sb.Length > 0 && sb[0] != 'n')
                 {
-                    Plugin.MyLog.LogInfo($"[FSR4] active provider: {sb} (FSR4={(Fsr4IsFsr4Active() == 1)})");
+                    _activeProviderStr = (Fsr4IsFsr4Active() == 1 ? "FSR4 " : "FSR ") + sb;
+                    Plugin.MyLog.LogInfo($"[FSR4] active — {_activeProviderStr}");
                     _loggedActiveProvider = true;
                 }
+            }
+
+            // One clean line whenever the resolution changes (quality change / Native AA toggle), throttled
+            // (1s) so a transient render-size flip-flop can't spam.
+            if ((renderW != _lastRW || renderH != _lastRH || outW != _lastOW || outH != _lastOH)
+                && Time.realtimeSinceStartup - _lastResLogTime > 1f)
+            {
+                _lastRW = renderW; _lastRH = renderH; _lastOW = outW; _lastOH = outH;
+                _lastResLogTime = Time.realtimeSinceStartup;
+                Plugin.MyLog.LogInfo($"[FSR4] {_activeProviderStr}{(vr ? " (VR)" : "")} — render {renderW}x{renderH} -> {outW}x{outH}");
             }
             return true;
         }

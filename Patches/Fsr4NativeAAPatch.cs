@@ -36,7 +36,8 @@ namespace FSR4Bridge.Patches
             // Only override an UPSCALING request (0 < r < 1) — leave native (1.0) and supersampling (>1) alone.
             if (superSamplingRatio > 0f && superSamplingRatio < 1f)
             {
-                Plugin.MyLog.LogInfo($"[FSR4] Native AA: render ratio {superSamplingRatio:F3} -> {NearNative}");
+                if (Fsr4Config.DebugLog.Value)
+                    Plugin.MyLog.LogInfo($"[FSR4] Native AA: render ratio {superSamplingRatio:F3} -> {NearNative}");
                 superSamplingRatio = NearNative;
             }
         }

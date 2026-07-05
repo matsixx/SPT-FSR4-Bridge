@@ -19,6 +19,10 @@ If your card does not support FSR4 and you select it, it will auto fallback to 3
 
 ## SPT-VR Support
 
-You will need to be on version 1.3.1+ of SPT-VR for this bridge more to work. I had to add special support for the VR mod since it changes
+You will need to be on version 1.3.1+ of SPT-VR for this bridge to work. I had to add special support for the VR mod since it changes
 a lot of upscaler code.
 
+## Credits
+
+- AMD Fidelity FX SDK - https://gpuopen.com/amd-fidelityfx-sdk/
+- Claude code for a lot of the bridge logic
