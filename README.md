@@ -3,6 +3,8 @@
 Routes the game's FSR3 upscaler to **AMD FSR4** (or the latest **FSR 3.1.x** as a fallback) via a
 native D3D11→D3D12 bridge. This is built using the latest FSR SDK, so it supports FSR 4.1.1 which works with RDNA3.
 
+If your card does not support FSR4 and you select it, it will auto fallback to 3.1.x.
+
 ## Use
 
 1. In the game's **Graphics** settings, select an **FSR3** quality mode
