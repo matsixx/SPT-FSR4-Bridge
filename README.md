@@ -22,12 +22,3 @@ If your card does not support FSR4 and you select it, it will auto fallback to 3
 You will need to be on version 1.3.1+ of SPT-VR for this bridge more to work. I had to add special support for the VR mod since it changes
 a lot of upscaler code.
 
-## Building
-
-- Managed: `dotnet build -c Debug` (auto-deploys to the game via the csproj `DeployToGame` target).
-- Native: `native/build.bat` (MSVC, static CRT → `native/build/FSR4Native.dll`); the deploy target
-  copies it + the AMD runtime into the plugin folder.
-
-The native bridge is generic D3D interop (no VR, no Unity) — the same source as the SPT-VR mod's
-`SPTVR_FSR4.dll`, built here as `FSR4Native.dll` so the managed mod (`FSR4Bridge.dll`) and the native
-helper never share a base name.
