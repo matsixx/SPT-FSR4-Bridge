@@ -11,9 +11,10 @@
 // per-eye slot ring beforehand, so a lagging render thread can never read torn params.
 //
 // FSR version selection: ffxQuery(GetVersions) enumerates the providers exposed by
-// amd_fidelityfx_loader_dx12/amd_fidelityfx_upscaler_dx12 (FSR4 shows up only on RDNA4 with a
-// driver that ships amdxcffx64). We pick the highest major-4 version when preferred, else the
-// default provider (latest 3.1.x) — so the same code path degrades gracefully on any GPU.
+// amd_fidelityfx_loader_dx12/amd_fidelityfx_upscaler_dx12 (FSR4 shows up on RDNA4, and on RDNA3 via the
+// FSR 4.1+ INT8 model, when the driver ships amdxcffx64). We pick the highest major-4 version when
+// preferred, else the default provider (latest 3.1.x). This bridge is architecture-agnostic — the
+// INT8-vs-FP8 model choice happens inside the driver's provider — so the same code path works on any GPU.
 //
 // Built against the MIT-licensed FidelityFX SDK 2.3.0 ffx-api headers (vendored under ffx/).
 
@@ -54,6 +55,7 @@ enum Fsr4Status : int
     FSR4_NO_VERSIONS         = 6,
     FSR4_CONTEXT_FAILED      = 7,
     FSR4_DISPATCH_FAILED     = 8,
+    FSR4_DEVICE_LOST         = 9,   // D3D12 device removed (renderer refresh) — RECOVERABLE: rebuild + retry
 };
 
 // context-creation flag bits passed from C# (not the raw FFX flags so C# stays decoupled)
@@ -67,6 +69,8 @@ enum Fsr4Flags : int
     FSR4F_DYNAMIC_RES     = 1 << 5,
     FSR4F_PREFER_FSR4     = 1 << 6,
     FSR4F_RESET           = 1 << 7,  // per-frame history reset request
+    FSR4F_MV_JITTER_CANCEL = 1 << 8, // motion vectors have the jitter baked in (FSR removes it)
+    FSR4F_REACTIVE        = 1 << 9,  // opaque-only color supplied → auto-generate + feed a reactive mask
 };
 
 // ---------------------------------------------------------------- logging (drained by C# into BepInEx log)
@@ -112,11 +116,42 @@ static std::atomic<int>     gStatus{FSR4_NOT_INITIALIZED};
 
 static HMODULE      gLoaderModule   = nullptr;
 static HMODULE      gUpscalerModule = nullptr;   // preloaded so the loader's by-name resolution hits it
+static HMODULE      gDxilModule     = nullptr;   // the Agility SDK's DXIL validator
+static std::wstring gFfxDir;                      // the native/ folder the DLLs live in
 static PfnFfxCreateContext  pfnCreateContext  = nullptr;
 static PfnFfxDestroyContext pfnDestroyContext = nullptr;
 static PfnFfxConfigure      pfnConfigure      = nullptr;
 static PfnFfxQuery          pfnQuery          = nullptr;
 static PfnFfxDispatch       pfnDispatch       = nullptr;
+
+// The AMD FFX provider (amd_fidelityfx_upscaler_dx12 / the driver's amdxcffx64) can access-violate
+// inside these calls on some GPU/driver combos (observed: a non-RDNA4 AMD card during the first
+// dispatch). A native AV in a third-party DLL isn't a C++ exception, so it would take the whole game
+// down. These SEH shims turn such a crash into a sentinel return code, which the callers treat as a
+// normal failure → FSR4 disables and the game falls back to its own FSR3. The shims are object-free
+// (no C++ unwinding) so __try/__except is legal here.
+static const ffxReturnCode_t FFX_SEH_CRASH = 0x0BADC0DE;
+
+static ffxReturnCode_t SafeFfxQuery(ffxContext* ctx, ffxQueryDescHeader* desc)
+{
+    __try { return pfnQuery(ctx, desc); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return FFX_SEH_CRASH; }
+}
+static ffxReturnCode_t SafeFfxCreateContext(ffxContext* ctx, ffxCreateContextDescHeader* desc)
+{
+    __try { return pfnCreateContext(ctx, desc, nullptr); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return FFX_SEH_CRASH; }
+}
+static ffxReturnCode_t SafeFfxDispatch(ffxContext* ctx, ffxDispatchDescHeader* desc)
+{
+    __try { return pfnDispatch(ctx, desc); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return FFX_SEH_CRASH; }
+}
+static void SafeFfxDestroyContext(ffxContext* ctx)
+{
+    __try { pfnDestroyContext(ctx, nullptr); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { }
+}
 
 static ComPtr<ID3D11Device>          g11;
 static ComPtr<ID3D11Device1>         g11_1;
@@ -134,7 +169,9 @@ static HANDLE                        gFenceEvent = nullptr;
 static bool                  gVersionsQueried = false;
 static std::vector<uint64_t> gVersionIds;
 static std::vector<std::string> gVersionNames;
-static uint64_t              gChosenVersionId  = 0;   // 0 = no override (provider default)
+static uint64_t              gVersionIdFsr4 = 0;   // highest "4.x" version id (0 = none)
+static uint64_t              gVersionId3x   = 0;   // highest "3.x" version id (0 = none)
+static bool                  gForceProvider3x = false; // set after FSR4 crashed on this GPU (e.g. RDNA3)
 static bool                  gChosenIsFsr4     = false;
 static char                  gActiveVersionName[128] = "none";
 
@@ -154,6 +191,7 @@ struct FrameParams
     void* depthTex;
     void* mvecTex;
     void* outTex;
+    void* opaqueTex;   // opaque-only color (pre-transparency) for reactive-mask generation; null = disabled
     int   renderW, renderH;
     int   outW, outH;
     float jitterX, jitterY;
@@ -172,7 +210,9 @@ struct Eye
     FrameParams paramSlots[PARAM_SLOTS] = {};
     std::mutex  paramMutex;
 
-    SharedTex color, depth, mvec, output;
+    SharedTex color, depth, mvec, output, opaque;
+    ComPtr<ID3D12Resource> reactiveMask;   // D3D12-internal (not shared) UAV target for the reactive mask
+    UINT reactiveW = 0, reactiveH = 0;
 
     ffxContext ctx = nullptr;
     UINT ctxOutW = 0, ctxOutH = 0;
@@ -192,7 +232,7 @@ static void DestroyEyeContext(Eye& eye)
 {
     if (eye.ctx)
     {
-        pfnDestroyContext(&eye.ctx, nullptr);
+        SafeFfxDestroyContext(&eye.ctx);
         eye.ctx = nullptr;
     }
     eye.firstDispatch = true;
@@ -205,6 +245,42 @@ static void ReleaseEyeResources(Eye& eye)
     eye.depth  = SharedTex{};
     eye.mvec   = SharedTex{};
     eye.output = SharedTex{};
+    eye.opaque = SharedTex{};
+    eye.reactiveMask.Reset();
+    eye.reactiveW = eye.reactiveH = 0;
+}
+
+// The reactive mask is a D3D12-INTERNAL target (not shared with D3D11): the generate-reactive dispatch
+// writes it (UAV) and the upscale dispatch reads it, both on our private device — no cross-API handoff.
+static bool EnsureReactiveMask(Eye& e, UINT w, UINT h)
+{
+    if (e.reactiveMask && e.reactiveW == w && e.reactiveH == h)
+        return true;
+    e.reactiveMask.Reset();
+
+    D3D12_HEAP_PROPERTIES heap = {};
+    heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC rd = {};
+    rd.Dimension        = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    rd.Width            = w;
+    rd.Height           = h;
+    rd.DepthOrArraySize = 1;
+    rd.MipLevels        = 1;
+    rd.Format           = DXGI_FORMAT_R8_UNORM;   // FSR reactive mask format
+    rd.SampleDesc       = {1, 0};
+    rd.Layout           = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    rd.Flags            = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+
+    HRESULT hr = g12->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &rd,
+                                              D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&e.reactiveMask));
+    if (FAILED(hr))
+    {
+        Log("[FSR4] reactive mask create failed 0x%08lX", hr);
+        return false;
+    }
+    e.reactiveW = w;
+    e.reactiveH = h;
+    return true;
 }
 
 static void WaitQueueIdle()
@@ -225,7 +301,14 @@ static bool LoadFfxLibrary(const wchar_t* dir)
     if (pfnCreateContext)
         return true;
 
+    gFfxDir = dir;
+
     wchar_t path[MAX_PATH];
+
+    // Preload the DXIL validator so D3D12Core (Agility SDK) can validate the FSR4 shaders regardless
+    // of the process DLL search path. Harmless if it isn't needed.
+    swprintf_s(path, L"%s\\dxil.dll", dir);
+    gDxilModule = LoadLibraryExW(path, nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
 
     // Preload the upscaler provider DLL first so the loader's internal by-name LoadLibrary
     // resolves to it regardless of the process's DLL search path (we live in a BepInEx plugin
@@ -276,13 +359,92 @@ static bool LoadFfxLibrary(const wchar_t* dir)
     return true;
 }
 
+// Create the D3D12 device, opting into the bundled DirectX 12 Agility SDK runtime (D3D12Core.dll)
+// FIRST. FSR4 4.1.1 requires Shader Model 6.6, which per AMD requires the DX12 Agility SDK 1.4.9+ —
+// the OS's built-in D3D12 runtime is too old, so without this the FSR4 shaders (especially the RDNA3
+// INT8 path) access-violate on dispatch. We opt in at runtime via CreateDeviceFactory (works from a
+// plugin DLL — the usual exe-export method isn't available to us). Falls back to the OS runtime if the
+// Agility core is missing or the opt-in is refused.
+static HRESULT CreateD3D12DeviceWithAgility(IDXGIAdapter* adapter)
+{
+    std::wstring coreDirW = gFfxDir + L"\\D3D12\\";     // folder holding D3D12Core.dll
+    char coreDir[MAX_PATH] = {};
+    WideCharToMultiByte(CP_UTF8, 0, coreDirW.c_str(), -1, coreDir, sizeof(coreDir) - 1, nullptr, nullptr);
+
+    ComPtr<ID3D12SDKConfiguration1> sdkConfig;
+    if (SUCCEEDED(D3D12GetInterface(CLSID_D3D12SDKConfiguration, IID_PPV_ARGS(&sdkConfig))))
+    {
+        ComPtr<ID3D12DeviceFactory> factory;
+        // 616 = the Agility SDK version the FSR SDK 2.3 sample ships (well past the required 1.4.9).
+        HRESULT hrf = sdkConfig->CreateDeviceFactory(616, coreDir, IID_PPV_ARGS(&factory));
+        if (SUCCEEDED(hrf) && factory)
+        {
+            HRESULT hrd = factory->CreateDevice(adapter, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&g12));
+            if (SUCCEEDED(hrd) && g12)
+            {
+                Log("[FSR4] D3D12 device via Agility SDK v616 (SM 6.6 available for FSR4) — %s", coreDir);
+                return S_OK;
+            }
+            Log("[FSR4] Agility CreateDevice failed (0x%08lX) — falling back to OS D3D12", hrd);
+        }
+        else
+        {
+            Log("[FSR4] Agility CreateDeviceFactory failed (0x%08lX, path=%s) — falling back to OS D3D12 "
+                "(FSR4 may be unavailable / RDNA3 will crash → 3.1.x). Enable Windows Developer Mode if this persists.", hrf, coreDir);
+        }
+    }
+    else
+    {
+        Log("[FSR4] D3D12GetInterface(SDKConfiguration) unavailable — OS D3D12 too old for the Agility opt-in");
+    }
+
+    return D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&g12));
+}
+
 // Bring up the D3D11 views + the private D3D12 device/queue/fence from any Unity texture.
 static bool EnsureDevices(ID3D11Texture2D* anyUnityTex)
 {
-    if (g12)
+    // Re-validate against Unity's CURRENT D3D11 device every call. On a renderer refresh (EFT does one
+    // when the SteamVR dashboard opens) the game can recreate its D3D11 device; our cached device,
+    // context, shared textures and interop fence are then stranded on the OLD device, and the very next
+    // CopyResource runs cross-device → driver crash. If the device changed, fully tear down and rebuild
+    // from the new one. Costs the FSR4 model-reload hitch, but ONLY on an actual device change — and a
+    // one-time hitch beats a crash. (No-op on the common case where the device is unchanged.)
+    ComPtr<ID3D11Device> curDev;
+    anyUnityTex->GetDevice(&curDev);
+
+    // Two ways the interop can go stale across a renderer refresh (SteamVR dashboard lowers the game's
+    // res in the background): (a) Unity recreates its D3D11 device, or (b) — the one actually observed —
+    // OUR private D3D12 device gets DEVICE_REMOVED. Either way, keep going with the dead device = every
+    // op fails (0x887A0005) → we'd drop FSR4 for the whole session. Detect both and fully rebuild.
+    HRESULT devReason  = g12 ? g12->GetDeviceRemovedReason() : S_OK;
+    bool deviceLost    = FAILED(devReason);
+    bool d3d11Changed  = g12 && curDev.Get() != g11.Get();
+
+    if (g12 && !deviceLost && !d3d11Changed)
         return true;
 
-    anyUnityTex->GetDevice(&g11);
+    if (g12)
+    {
+        if (deviceLost)
+            Log("[FSR4] D3D12 device REMOVED (reason 0x%08lX) — full rebuild", (unsigned long)devReason);
+        else
+            Log("[FSR4] Unity D3D11 device changed (renderer refresh) — full rebuild");
+        if (!deviceLost)
+            WaitQueueIdle();   // only touch the queue/fence while the device is still alive
+        for (int e = 0; e < 2; e++)
+        {
+            ReleaseEyeResources(gEyes[e]);
+            for (int i = 0; i < ALLOC_RING; i++) gEyes[e].alloc[i].Reset();
+            gEyes[e].cmdList.Reset();
+        }
+        gFence11.Reset(); gFence12.Reset(); gQueue.Reset(); g12.Reset();
+        gCtx11_4.Reset(); gCtx11.Reset(); g11_5.Reset(); g11_1.Reset(); g11.Reset();
+        if (gFenceEvent) { CloseHandle(gFenceEvent); gFenceEvent = nullptr; }
+        gVersionsQueried = false;
+    }
+
+    g11 = curDev;
     g11->GetImmediateContext(&gCtx11);
 
     if (FAILED(g11.As(&g11_1)) || FAILED(g11.As(&g11_5)) || FAILED(gCtx11.As(&gCtx11_4)))
@@ -302,7 +464,7 @@ static bool EnsureDevices(ID3D11Texture2D* anyUnityTex)
         return false;
     }
 
-    HRESULT hr = D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&g12));
+    HRESULT hr = CreateD3D12DeviceWithAgility(adapter.Get());
     if (FAILED(hr))
     {
         Log("[FSR4] D3D12CreateDevice failed (0x%08lX)", hr);
@@ -352,7 +514,7 @@ static bool EnsureDevices(ID3D11Texture2D* anyUnityTex)
     return true;
 }
 
-static void QueryVersionsOnce(bool preferFsr4)
+static void QueryVersionsOnce()
 {
     if (gVersionsQueried)
         return;
@@ -365,10 +527,11 @@ static void QueryVersionsOnce(bool preferFsr4)
     uint64_t count   = 0;
     q.outputCount    = &count;
 
-    ffxReturnCode_t rc = pfnQuery(nullptr, &q.header);
+    ffxReturnCode_t rc = SafeFfxQuery(nullptr, &q.header);
     if (rc != FFX_API_RETURN_OK || count == 0)
     {
-        Log("[FSR4] version query failed (rc=%u, count=%llu)", rc, (unsigned long long)count);
+        Log("[FSR4] version query failed (rc=0x%X%s, count=%llu)", rc,
+            rc == FFX_SEH_CRASH ? " CRASHED" : "", (unsigned long long)count);
         gStatus = FSR4_NO_VERSIONS;
         return;
     }
@@ -377,17 +540,17 @@ static void QueryVersionsOnce(bool preferFsr4)
     std::vector<const char*> names(count);
     q.versionIds   = ids.data();
     q.versionNames = names.data();
-    rc = pfnQuery(nullptr, &q.header);
+    rc = SafeFfxQuery(nullptr, &q.header);
     if (rc != FFX_API_RETURN_OK)
     {
-        Log("[FSR4] version id/name query failed (rc=%u)", rc);
+        Log("[FSR4] version id/name query failed (rc=0x%X)", rc);
         gStatus = FSR4_NO_VERSIONS;
         return;
     }
 
     gVersionIds.clear();
     gVersionNames.clear();
-    int bestFsr4 = -1;
+    int bestFsr4 = -1, best3x = -1;
     for (uint64_t i = 0; i < count; i++)
     {
         const char* name = names[i] ? names[i] : "?";
@@ -395,31 +558,37 @@ static void QueryVersionsOnce(bool preferFsr4)
         gVersionNames.emplace_back(name);
         Log("[FSR4] available upscaler version: %s (id 0x%016llX)", name, (unsigned long long)ids[i]);
 
-        // FSR4 providers report names beginning with "4." (e.g. "4.0.2"); pick the first/highest.
+        // Providers report names beginning with the major version, e.g. "4.1.1" / "3.1.5" (maybe with
+        // an "FSR " prefix). Track the highest 4.x (FSR4) and the highest 3.x (FSR 3.1.x) separately.
         const char* p = name;
         while (*p && (*p < '0' || *p > '9')) p++;   // skip any "FSR " style prefix
         if (*p == '4' && p[1] == '.')
         {
-            if (bestFsr4 < 0 || strcmp(name, gVersionNames[bestFsr4].c_str()) > 0)
-                bestFsr4 = (int)i;
+            if (bestFsr4 < 0 || strcmp(name, gVersionNames[bestFsr4].c_str()) > 0) bestFsr4 = (int)i;
+        }
+        else if (*p == '3' && p[1] == '.')
+        {
+            if (best3x < 0 || strcmp(name, gVersionNames[best3x].c_str()) > 0) best3x = (int)i;
         }
     }
+    gVersionIdFsr4 = bestFsr4 >= 0 ? gVersionIds[bestFsr4] : 0;
+    gVersionId3x   = best3x   >= 0 ? gVersionIds[best3x]   : 0;
+    Log("[FSR4] providers: FSR4=%s, 3.1.x=%s",
+        bestFsr4 >= 0 ? gVersionNames[bestFsr4].c_str() : "(none)",
+        best3x   >= 0 ? gVersionNames[best3x].c_str()   : "(none)");
+}
 
-    if (preferFsr4 && bestFsr4 >= 0)
+// Picks the version override for a new context: FSR4 when preferred + available + not disabled after a
+// crash; otherwise the 3.1.x provider. Returns 0 only if neither is enumerable (falls to ffx default).
+static uint64_t ResolveProviderVersionId(bool preferFsr4)
+{
+    if (preferFsr4 && !gForceProvider3x && gVersionIdFsr4 != 0)
     {
-        gChosenVersionId = gVersionIds[bestFsr4];
-        gChosenIsFsr4    = true;
-        Log("[FSR4] selected FSR4 provider: %s", gVersionNames[bestFsr4].c_str());
+        gChosenIsFsr4 = true;
+        return gVersionIdFsr4;
     }
-    else
-    {
-        gChosenVersionId = 0;   // provider default (latest 3.1.x)
-        gChosenIsFsr4    = false;
-        if (preferFsr4)
-            Log("[FSR4] no FSR4 provider available (needs RDNA4 GPU + recent AMD driver) — using default provider");
-        else
-            Log("[FSR4] FSR4 not preferred — using default provider");
-    }
+    gChosenIsFsr4 = false;
+    return gVersionId3x;   // force the 3.1.x provider (0 → ffx default only if no 3.x enumerated)
 }
 
 static bool CreateEyeContext(Eye& eye, UINT outW, UINT outH, int flags)
@@ -433,6 +602,7 @@ static bool CreateEyeContext(Eye& eye, UINT outW, UINT outH, int flags)
     if (flags & FSR4F_AUTO_EXPOSURE)  ffxFlags |= FFX_UPSCALE_ENABLE_AUTO_EXPOSURE;
     if (flags & FSR4F_DEBUG_CHECKING) ffxFlags |= FFX_UPSCALE_ENABLE_DEBUG_CHECKING;
     if (flags & FSR4F_DYNAMIC_RES)    ffxFlags |= FFX_UPSCALE_ENABLE_DYNAMIC_RESOLUTION;
+    if (flags & FSR4F_MV_JITTER_CANCEL) ffxFlags |= FFX_UPSCALE_ENABLE_MOTION_VECTORS_JITTER_CANCELLATION;
 
     // maxRenderSize = output size: with dynamic resolution on, any render res up to the output
     // res works without recreating the context — quality-preset changes and transient renderer
@@ -454,27 +624,41 @@ static bool CreateEyeContext(Eye& eye, UINT outW, UINT outH, int flags)
     apiVersion.version     = FFX_UPSCALER_VERSION;
     backend.header.pNext   = &apiVersion.header;
 
+    bool preferFsr4 = (flags & FSR4F_PREFER_FSR4) != 0;
+    uint64_t overrideId = ResolveProviderVersionId(preferFsr4);
+
     ffxOverrideVersion over = {};
-    if (gChosenVersionId != 0)
+    over.header.type = FFX_API_DESC_TYPE_OVERRIDE_VERSION;
+    if (overrideId != 0)
     {
-        over.header.type       = FFX_API_DESC_TYPE_OVERRIDE_VERSION;
-        over.versionId         = gChosenVersionId;
+        over.versionId         = overrideId;
         apiVersion.header.pNext = &over.header;
     }
 
-    ffxReturnCode_t rc = pfnCreateContext(&eye.ctx, &desc.header, nullptr);
-    if (rc != FFX_API_RETURN_OK && gChosenVersionId != 0)
+    ffxReturnCode_t rc = SafeFfxCreateContext(&eye.ctx, &desc.header);
+
+    // If creating the FSR4 context itself crashed, permanently drop to the 3.1.x provider and retry.
+    if (rc == FFX_SEH_CRASH && gChosenIsFsr4 && !gForceProvider3x)
     {
-        // FSR4 provider refused (e.g. dynamic-res unsupported) — retry with the default provider.
-        Log("[FSR4] context creation with version override failed (rc=%u) — retrying default provider", rc);
+        Log("[FSR4] FSR4 context creation crashed on this GPU — switching to the FSR 3.1.x provider");
+        gForceProvider3x = true;
+        overrideId = ResolveProviderVersionId(preferFsr4);
+        over.versionId = overrideId;
+        apiVersion.header.pNext = overrideId != 0 ? &over.header : nullptr;
+        rc = SafeFfxCreateContext(&eye.ctx, &desc.header);
+    }
+    // A non-crash refusal of the override — retry with the ffx default provider.
+    else if (rc != FFX_API_RETURN_OK && rc != FFX_SEH_CRASH && overrideId != 0)
+    {
+        Log("[FSR4] context creation with version override failed (rc=0x%X) — retrying default provider", rc);
         apiVersion.header.pNext = nullptr;
-        gChosenVersionId = 0;
         gChosenIsFsr4    = false;
-        rc = pfnCreateContext(&eye.ctx, &desc.header, nullptr);
+        rc = SafeFfxCreateContext(&eye.ctx, &desc.header);
     }
     if (rc != FFX_API_RETURN_OK)
     {
-        Log("[FSR4] ffxCreateContext failed (rc=%u, out %ux%u, flags 0x%X)", rc, outW, outH, ffxFlags);
+        Log("[FSR4] ffxCreateContext failed (rc=0x%X%s, out %ux%u, flags 0x%X)", rc,
+            rc == FFX_SEH_CRASH ? " CRASHED — disabling FSR4, game will fall back to FSR3" : "", outW, outH, ffxFlags);
         eye.ctx = nullptr;
         gStatus = FSR4_CONTEXT_FAILED;
         return false;
@@ -482,7 +666,7 @@ static bool CreateEyeContext(Eye& eye, UINT outW, UINT outH, int flags)
 
     ffxQueryGetProviderVersion pv = {};
     pv.header.type = FFX_API_QUERY_DESC_TYPE_GET_PROVIDER_VERSION;
-    if (pfnQuery(&eye.ctx, &pv.header) == FFX_API_RETURN_OK && pv.versionName)
+    if (SafeFfxQuery(&eye.ctx, &pv.header) == FFX_API_RETURN_OK && pv.versionName)
     {
         strncpy_s(gActiveVersionName, pv.versionName, _TRUNCATE);
         Log("[FSR4] upscale context created: provider %s (out %ux%u, flags 0x%X)", pv.versionName, outW, outH, ffxFlags);
@@ -644,18 +828,39 @@ static void DoRenderEvent(int eventId)
         return;
     }
 
+    // Optional opaque-only color for reactive-mask generation. Failure here just disables reactive for
+    // the frame — never fails the upscale.
+    ComPtr<ID3D11Texture2D> opaqueTex;
+    bool wantReactive = (p.flags & FSR4F_REACTIVE) && p.opaqueTex != nullptr;
+    if (wantReactive)
+        ((IUnknown*)p.opaqueTex)->QueryInterface(IID_PPV_ARGS(&opaqueTex));
+
     if (!EnsureDevices(colorTex.Get()))
         return;
-    QueryVersionsOnce((p.flags & FSR4F_PREFER_FSR4) != 0);
+    QueryVersionsOnce();
     if (gStatus == FSR4_NO_VERSIONS)
         return;
+
+    // Before tearing down / recreating any shared texture or the context on a RESIZE, idle the GPU —
+    // freeing a resource the GPU is still using is an AMD driver TDR (device removed). This bites
+    // specifically on the SteamVR-dashboard resolution drop at NATIVE AA: there render size == output
+    // size, so the OUTPUT shrinks too, forcing a context + output-texture rebuild that the normal
+    // upscaling path never triggers (there the output stays fixed and only the render shrinks).
+    if (e.ctx && ((UINT)p.outW != e.ctxOutW || (UINT)p.outH != e.ctxOutH
+                  || (e.color.tex11 && (UINT)p.renderW != e.color.width)))
+    {
+        WaitQueueIdle();
+    }
 
     if (!EnsureSharedTex(e.color, colorTex.Get(), false, "color") ||
         !EnsureSharedTex(e.depth, depthTex.Get(), false, "depth") ||
         !EnsureSharedTex(e.mvec, mvecTex.Get(), false, "mvec") ||
         !EnsureSharedTex(e.output, outTex.Get(), true, "output"))
     {
-        gStatus = FSR4_DEVICE_FAILED;
+        // If the share failed because OUR D3D12 device was removed (dashboard renderer refresh), flag it
+        // RECOVERABLE so C# keeps calling us — next frame EnsureDevices rebuilds the device. Otherwise it's
+        // a genuine hard failure (fall back to shader FSR3 for the session).
+        gStatus = (g12 && FAILED(g12->GetDeviceRemovedReason())) ? FSR4_DEVICE_LOST : FSR4_DEVICE_FAILED;
         return;
     }
 
@@ -666,10 +871,22 @@ static void DoRenderEvent(int eventId)
             return;
     }
 
+    // Reactive-mask inputs (opaque-only color + the internal mask target). Any failure just disables
+    // reactive for this frame — the upscale below still runs.
+    if (wantReactive)
+    {
+        if (!opaqueTex ||
+            !EnsureSharedTex(e.opaque, opaqueTex.Get(), false, "opaque") ||
+            !EnsureReactiveMask(e, (UINT)p.renderW, (UINT)p.renderH))
+            wantReactive = false;
+    }
+
     // --- D3D11: copy this frame's inputs into the shared textures, then hand off to D3D12.
     gCtx11->CopyResource(e.color.tex11.Get(), colorTex.Get());
     gCtx11->CopyResource(e.depth.tex11.Get(), depthTex.Get());
     gCtx11->CopyResource(e.mvec.tex11.Get(), mvecTex.Get());
+    if (wantReactive)
+        gCtx11->CopyResource(e.opaque.tex11.Get(), opaqueTex.Get());
 
     UINT64 handoff = ++gFenceValue;
     gCtx11_4->Signal(gFence11.Get(), handoff);
@@ -687,6 +904,29 @@ static void DoRenderEvent(int eventId)
     e.alloc[ai]->Reset();
     e.cmdList->Reset(e.alloc[ai].Get(), nullptr);
 
+    // Generate the reactive mask FIRST (opaque-only vs full color → where translucency/particles changed),
+    // recorded onto the same command list so it runs right before the upscale reads it. FFX barriers the
+    // mask back to COMMON at the end of this dispatch, so the upscale below reads it consistently.
+    bool reactiveReady = false;
+    if (wantReactive)
+    {
+        ffxDispatchDescUpscaleGenerateReactiveMask gr = {};
+        gr.header.type     = FFX_API_DISPATCH_DESC_TYPE_UPSCALE_GENERATEREACTIVEMASK;
+        gr.commandList     = e.cmdList.Get();
+        gr.colorOpaqueOnly = ffxApiGetResourceDX12(e.opaque.res12.Get(),      FFX_API_RESOURCE_STATE_COMMON);
+        gr.colorPreUpscale = ffxApiGetResourceDX12(e.color.res12.Get(),       FFX_API_RESOURCE_STATE_COMMON);
+        gr.outReactive     = ffxApiGetResourceDX12(e.reactiveMask.Get(),      FFX_API_RESOURCE_STATE_COMMON);
+        gr.renderSize      = {(uint32_t)p.renderW, (uint32_t)p.renderH};
+        gr.scale           = 1.0f;
+        gr.cutoffThreshold = 0.2f;
+        gr.binaryValue     = 0.9f;
+        gr.flags           = FFX_UPSCALE_AUTOREACTIVEFLAGS_APPLY_THRESHOLD | FFX_UPSCALE_AUTOREACTIVEFLAGS_USE_COMPONENTS_MAX;
+        ffxReturnCode_t grc = SafeFfxDispatch(&e.ctx, &gr.header);
+        reactiveReady = (grc == FFX_API_RETURN_OK);
+        if (!reactiveReady)
+            Log("[FSR4] generate-reactive dispatch failed (rc=0x%X) — upscaling without it this frame", grc);
+    }
+
     ffxDispatchDescUpscale d = {};
     d.header.type   = FFX_API_DISPATCH_DESC_TYPE_UPSCALE;
     d.commandList   = e.cmdList.Get();
@@ -694,6 +934,8 @@ static void DoRenderEvent(int eventId)
     d.depth         = ffxApiGetResourceDX12(e.depth.res12.Get(), FFX_API_RESOURCE_STATE_COMMON);
     d.motionVectors = ffxApiGetResourceDX12(e.mvec.res12.Get(), FFX_API_RESOURCE_STATE_COMMON);
     d.output        = ffxApiGetResourceDX12(e.output.res12.Get(), FFX_API_RESOURCE_STATE_COMMON);
+    if (reactiveReady)
+        d.reactive  = ffxApiGetResourceDX12(e.reactiveMask.Get(), FFX_API_RESOURCE_STATE_COMMON);
     d.jitterOffset      = {p.jitterX, p.jitterY};
     d.motionVectorScale = {p.mvScaleX, p.mvScaleY};
     d.renderSize        = {(uint32_t)p.renderW, (uint32_t)p.renderH};
@@ -708,12 +950,28 @@ static void DoRenderEvent(int eventId)
     d.cameraFovAngleVertical = p.fovY;
     d.viewSpaceToMetersFactor = 1.0f;
 
-    ffxReturnCode_t rc = pfnDispatch(&e.ctx, &d.header);
+    ffxReturnCode_t rc = SafeFfxDispatch(&e.ctx, &d.header);
     if (rc != FFX_API_RETURN_OK)
     {
         // close/submit nothing; leave output untouched (C# falls back once it polls status)
         e.cmdList->Close();
-        Log("[FSR4] ffxDispatch failed (rc=%u)", rc);
+
+        // FSR4 dispatch crashed on this GPU (e.g. RDNA3's INT8 path) — switch to the native FSR 3.1.x
+        // provider and rebuild the contexts. Next frame retries with 3.1.x instead of dropping all the
+        // way to the game's shader FSR3. (If 3.1.x ALSO crashes, gForceProvider3x is set so we won't
+        // loop — it falls through to the hard-fail below.)
+        if (rc == FFX_SEH_CRASH && gChosenIsFsr4 && !gForceProvider3x)
+        {
+            Log("[FSR4] FSR4 dispatch crashed on this GPU — switching to the FSR 3.1.x provider (retry next frame)");
+            gForceProvider3x = true;
+            for (int i = 0; i < 2; i++)
+                DestroyEyeContext(gEyes[i]);
+            gStatus = FSR4_OK;   // not a hard failure — let it retry next frame with 3.1.x
+            return;
+        }
+
+        Log("[FSR4] ffxDispatch failed (rc=0x%X%s)", rc,
+            rc == FFX_SEH_CRASH ? " CRASHED — disabling FSR4, game will fall back to FSR3" : "");
         gStatus = FSR4_DISPATCH_FAILED;
         return;
     }
@@ -766,7 +1024,7 @@ FSR4_EXPORT int Fsr4Preflight(void* anyUnityTexture, int flags)
 
     if (!EnsureDevices(tex.Get()))
         return gStatus.load();
-    QueryVersionsOnce((flags & FSR4F_PREFER_FSR4) != 0);
+    QueryVersionsOnce();
     if (gStatus == FSR4_NO_VERSIONS)
         return gStatus.load();
 
@@ -781,7 +1039,7 @@ FSR4_EXPORT int Fsr4Preflight(void* anyUnityTexture, int flags)
 
 FSR4_EXPORT void Fsr4SetEyeFrameParams(
     int eye, int slot,
-    void* colorTex, void* depthTex, void* mvecTex, void* outTex,
+    void* colorTex, void* depthTex, void* mvecTex, void* outTex, void* opaqueTex,
     int renderW, int renderH, int outW, int outH,
     float jitterX, float jitterY, float mvScaleX, float mvScaleY,
     float camNear, float camFar, float fovY,
@@ -791,7 +1049,7 @@ FSR4_EXPORT void Fsr4SetEyeFrameParams(
         return;
     Eye& e = gEyes[eye];
     FrameParams p;
-    p.colorTex = colorTex; p.depthTex = depthTex; p.mvecTex = mvecTex; p.outTex = outTex;
+    p.colorTex = colorTex; p.depthTex = depthTex; p.mvecTex = mvecTex; p.outTex = outTex; p.opaqueTex = opaqueTex;
     p.renderW = renderW; p.renderH = renderH; p.outW = outW; p.outH = outH;
     p.jitterX = jitterX; p.jitterY = jitterY; p.mvScaleX = mvScaleX; p.mvScaleY = mvScaleY;
     p.camNear = camNear; p.camFar = camFar; p.fovY = fovY;

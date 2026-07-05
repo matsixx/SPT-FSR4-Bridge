@@ -8,10 +8,6 @@ using UnityEngine.Rendering;
 
 namespace FSR4Bridge.Patches
 {
-    // Hooks the game's FSR3 upscale entry point. When "Enable FSR4" is on and the native bridge can
-    // run this frame, we run FSR4/FSR3.1 instead and skip the in-engine FSR3 wrapper; otherwise we
-    // fall through to vanilla FSR3. Same enablement as the game (an FSR quality mode in Graphics
-    // settings drives EnableFSR3 + the render-res downscale) — we just swap the upscaler.
     internal class Fsr4RenderPatch : ModulePatch
     {
         protected override MethodBase GetTargetMethod()
@@ -27,8 +23,6 @@ namespace FSR4Bridge.Patches
         static bool Prefix(SSAAImpl __instance, RenderTexture source, RenderTexture destination,
                            CommandBuffer externalCommandBuffer, ref bool __result, bool __runOriginal)
         {
-            // Defensive: if some other prefix (e.g. SPT-VR's FSR3 wrapper) already handled this frame,
-            // don't render on top of it. With our First priority we normally run before it.
             if (!__runOriginal)
                 return false;
 
@@ -38,10 +32,10 @@ namespace FSR4Bridge.Patches
                 if (Fsr4Bridge.RenderEye(source, destination, cam))
                 {
                     __result = true;
-                    return false;   // handled by FSR4 — skip the vanilla FSR3 wrapper
+                    return false;
                 }
             }
-            return true;            // run vanilla FSR3
+            return true;
         }
     }
 }

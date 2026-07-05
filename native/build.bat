@@ -22,7 +22,7 @@ REM /MT = static CRT so the DLL needs no VC++ redist on the user's machine.
 cl /nologo /LD /O2 /EHsc /MT /std:c++17 /DNDEBUG ^
    /Fo"build\\" /Fe"build\FSR4Native.dll" ^
    FSR4Native.cpp ^
-   /link d3d11.lib d3d12.lib dxgi.lib ^
+   /link d3d11.lib d3d12.lib dxgi.lib dxguid.lib ^
    /IMPLIB:"build\FSR4Native.lib"
 
 set RESULT=%errorlevel%

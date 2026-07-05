@@ -10,20 +10,6 @@ using UnityEngine.Rendering.PostProcessing;
 
 namespace FSR4Bridge.Source
 {
-    // Managed side of the native FSR4 bridge (FSR4Native.dll) for FLATSCREEN SPT.
-    //
-    // The native DLL runs FSR4 (or FSR 3.1.x) on a private D3D12 device and copies across a shared
-    // fence — see native/FSR4Native.cpp. This side, per frame:
-    //   1. loads the native DLL + AMD runtime from plugins/FSR4Bridge/native,
-    //   2. materializes the render-res color + depth + motion into owned RTs (the only way to hand
-    //      Unity's textures to the D3D12 side as native pointers),
-    //   3. feeds the pointers + camera params to the bridge,
-    //   4. issues the render-thread plugin event that does the upscale and writes the output.
-    //
-    // Enablement rides the game's existing FSR3 path (Fsr4RenderPatch hooks SSAAImpl.TryRenderFSR3):
-    // pick an FSR quality in Graphics settings, toggle "Enable FSR4" in the config. The FFX context
-    // uses dynamic resolution and is kept alive across renderer refreshes so quality changes don't
-    // rebuild it.
     internal static class Fsr4Bridge
     {
         private const string DLL = "FSR4Native";
@@ -37,14 +23,16 @@ namespace FSR4Bridge.Source
         private const int FSR4F_DYNAMIC_RES    = 1 << 5;
         private const int FSR4F_PREFER_FSR4    = 1 << 6;
         private const int FSR4F_RESET          = 1 << 7;
+        private const int FSR4F_MV_JITTER_CANCEL = 1 << 8;
+        private const int FSR4F_REACTIVE       = 1 << 9;
 
         private static bool _triedInit;
         private static bool _initOk;
         private static bool _permaFail;
+        private const int FSR4_DEVICE_LOST = 9;   // recoverable status (native rebuilds its device + retries)
+        private static int _deviceLostRetries;
         private static IntPtr _renderEventFunc = IntPtr.Zero;
 
-        // Set by Plugin when the SPT-VR mod is loaded → we drive VR (stereo, per-eye) FSR4 as well as
-        // flatscreen. Gates the VR-typed jitter helper so it's only JITted when SPT-VR is present.
         public static bool SptVrPresent;
 
         // Per-eye (index 0 = mono/left, 1 = right). Flatscreen only ever touches eye 0.
@@ -52,8 +40,16 @@ namespace FSR4Bridge.Source
         private static readonly RenderTexture[] _depthRT  = new RenderTexture[2];
         private static readonly RenderTexture[] _motionRT = new RenderTexture[2];
         private static CommandBuffer _cmd;
+
+        // Reactive-mask capture: a CommandBuffer at BeforeForwardAlpha blits the opaque-only color into an
+        // owned RT each frame (same technique the game's FSR3 wrapper uses), which we hand to the native
+        // reactive-mask generator. Flatscreen only for now (single owned RT; VR's per-eye capture is TBD).
+        private static RenderTexture _opaqueRT;
+        private static CommandBuffer _opaqueCmd;
+        private static Camera _opaqueCam;
         private static bool _loggedActiveProvider;
-        private static int _debugLogsLeft = 6;
+        private static int _debugLogsLeft = 8;
+        private static bool _prevDebugLog;
 
         private static readonly int _camDepthTexId  = Shader.PropertyToID("_CameraDepthTexture");
         private static readonly int _camMotionTexId = Shader.PropertyToID("_CameraMotionVectorsTexture");
@@ -67,7 +63,7 @@ namespace FSR4Bridge.Source
         [DllImport(DLL, CallingConvention = CallingConvention.Cdecl)]
         private static extern void Fsr4SetEyeFrameParams(
             int eye, int slot,
-            IntPtr colorTex, IntPtr depthTex, IntPtr mvecTex, IntPtr outTex,
+            IntPtr colorTex, IntPtr depthTex, IntPtr mvecTex, IntPtr outTex, IntPtr opaqueTex,
             int renderW, int renderH, int outW, int outH,
             float jitterX, float jitterY, float mvScaleX, float mvScaleY,
             float camNear, float camFar, float fovY,
@@ -150,8 +146,7 @@ namespace FSR4Bridge.Source
             }
         }
 
-        // Called from Fsr4RenderPatch in place of the game's FSR3 wrapper. Returns true if it drove
-        // the upscale (caller then skips the original), false to fall through to vanilla FSR3.
+        // Called from Fsr4RenderPatch in place of the game's FSR3 wrapper
         public static bool RenderEye(RenderTexture source, RenderTexture destination, Camera cam)
         {
             if (source == null || destination == null || cam == null)
@@ -159,21 +154,35 @@ namespace FSR4Bridge.Source
             if (_permaFail || !TryInit())
                 return false;
 
-            // Status reflects the previous frame's async result — any hard error → fall back to the
+            // Status reflects the previous frame's async result — any hard error falls back to the
             // game's shader FSR3 for the session so we never leave a broken frame up.
             int st = GetStatusSafe();
-            if (st >= 2)
+            if (st == FSR4_DEVICE_LOST)
             {
-                _permaFail = true;
-                Plugin.MyLog.LogWarning($"[FSR4] native status {st} — falling back to in-engine FSR3 for this session.");
-                DrainLog();
-                return false;
+                // Recoverable: our D3D12 device was removed by a renderer refresh (SteamVR dashboard lowers
+                // the game's res in the background). KEEP calling so the native rebuilds it on the next
+                // dispatch — usually one glitch frame, then it recovers. Give up only if it never comes back.
+                if (++_deviceLostRetries > 30)
+                {
+                    _permaFail = true;
+                    Plugin.MyLog.LogWarning("[FSR4] D3D12 device kept getting lost — falling back to in-engine FSR3 for this session.");
+                    DrainLog();
+                    return false;
+                }
+            }
+            else
+            {
+                _deviceLostRetries = 0;
+                if (st >= 2)
+                {
+                    _permaFail = true;
+                    Plugin.MyLog.LogWarning($"[FSR4] native status {st} — falling back to in-engine FSR3 for this session.");
+                    DrainLog();
+                    return false;
+                }
             }
 
-            // VR mode whenever SPT-VR is loaded (it's a VR-only mod, and TryRenderFSR3 only fires for
-            // the upscaled main cam) — per-eye contexts + the VR mod's own jitter (it owns the
-            // projection jitter, so the game's jitterPixelSpace is wrong there). This matches the VR
-            // mod's original FSR4 path exactly. Flatscreen: eye 0, game jitter.
+            // Detects if SPT-VR is present (soft-dep) so we can fetch the VRJitterComponent's jitter from SPT-VR.
             bool vr = SptVrPresent;
             int eye = ((int)cam.stereoActiveEye) & 1;
 
@@ -183,8 +192,9 @@ namespace FSR4Bridge.Source
             cam.depthTextureMode |= DepthTextureMode.Depth | DepthTextureMode.MotionVectors;
             Texture camDepth  = Shader.GetGlobalTexture(_camDepthTexId);
             Texture camMotion = Shader.GetGlobalTexture(_camMotionTexId);
+
             if (camDepth == null || camMotion == null)
-                return false;   // not ready yet (mode just enabled) — vanilla FSR3 covers this frame
+                return false; 
 
             int renderW = source.width;
             int renderH = source.height;
@@ -214,43 +224,72 @@ namespace FSR4Bridge.Source
             float camNear = cam.nearClipPlane;
             float camFar  = cam.farClipPlane;
 
-            // Jitter. VR: the VR mod's own jitter, negated, no flip (confirmed convention). Flatscreen:
-            // the game's jitterPixelSpace with the tunable sign/scale (flips default ON — see config).
+            // Jitter is handled different in VR vs flatscreen
+            float jScale = Fsr4Config.JitterScale.Value;
+            Vector2 gameJitter = TemporalAntialiasing.jitterPixelSpace;  
+            Vector2 vrJitter = Vector2.zero;
             Vector2 jitter;
             float jitterX, jitterY;
             if (vr)
             {
-                jitter  = GetVrJitter();
-                jitterX = -jitter.x;
-                jitterY = -jitter.y;
+                vrJitter = GetVrJitter();
+                if (Fsr4Config.VrUseGameJitter.Value)
+                {
+                    jitter = gameJitter;
+                    jitterX = jitter.x * jScale;
+                    jitterY = jitter.y * jScale;
+                }
+                else
+                {
+                    // Signs config-driven (default +x, -y = FSR's asymmetric convention). Flip toggles A/B
+                    // the residual edge jitter against the render's actual +x,+y projection jitter.
+                    jitter  = vrJitter;
+                    jitterX = jitter.x * jScale * (Fsr4Config.VrFlipJitterX.Value ? -1f :  1f);
+                    jitterY = jitter.y * jScale * (Fsr4Config.VrFlipJitterY.Value ?  1f : -1f);
+                }
             }
             else
             {
-                jitter  = TemporalAntialiasing.jitterPixelSpace;
-                float jScale = Fsr4Config.JitterScale.Value;
-                jitterX = (Fsr4Config.JitterFlipX.Value ? 1f : -1f) * jitter.x * jScale;
-                jitterY = (Fsr4Config.JitterFlipY.Value ? 1f : -1f) * jitter.y * jScale;
+                jitter  = gameJitter;
+                jitterX = jitter.x * jScale;
+                jitterY = jitter.y * jScale;
             }
 
-            // MV scale: final scale must be {sign, sign}; the native ffx-api divides by the MV target
-            // size, so pre-multiply by renderSize. Game FSR3 uses {-1,-1} (InvertMotionVectors on).
-            float mvSign = Fsr4Config.InvertMotionVectors.Value ? -1f : 1f;
-            float mvScaleX = mvSign * renderW;
-            float mvScaleY = mvSign * renderH;
+            // MV scale: final scale must be {-1,-1} (the game's FSR3 convention); the native ffx-api
+            // divides by the MV target size, so pre-multiply by renderSize.
+            float mvScaleX = -renderW;
+            float mvScaleY = -renderH;
 
             float dtMs = Time.deltaTime * 1000f;
 
-            int flags = FSR4F_DYNAMIC_RES;
-            if (IsHdrFormat(source.format))       flags |= FSR4F_HDR;
-            if (Fsr4Config.DepthInverted.Value)   flags |= FSR4F_DEPTH_INVERTED;
-            if (Fsr4Config.AutoExposure.Value)    flags |= FSR4F_AUTO_EXPOSURE;
-            if (Fsr4Config.PreferFsr4.Value)      flags |= FSR4F_PREFER_FSR4;
+            // Depth is reversed-Z + auto-exposure on
+            int flags = FSR4F_DYNAMIC_RES | FSR4F_DEPTH_INVERTED | FSR4F_AUTO_EXPOSURE;
+            if (Fsr4Config.DepthInfinite.Value)              flags |= FSR4F_DEPTH_INFINITE;
+            if (IsHdrFormat(source.format))                  flags |= FSR4F_HDR;
+            if (Fsr4Config.Upscaler.Value == EUpscaler.FSR4) flags |= FSR4F_PREFER_FSR4;
+            if (Fsr4Config.MvJitterCancel.Value)             flags |= FSR4F_MV_JITTER_CANCEL;
+
+            // Reactive mask (flatscreen + VR). Capture the opaque-only color at BeforeForwardAlpha and hand
+            // it to the native reactive-mask generator; the native no-ops if it's null. One capture RT is
+            // fine in VR MultiPass: the eyes render sequentially, so each eye's render event copies the RT
+            // before the next eye's BeforeForwardAlpha overwrites it (all in render-thread submission order).
+            IntPtr opaquePtr = IntPtr.Zero;
+            if (Fsr4Config.ReactiveMask.Value)
+            {
+                EnsureOpaqueCapture(cam, renderW, renderH, source.format);
+                opaquePtr = _opaqueRT.GetNativeTexturePtr();
+                if (opaquePtr != IntPtr.Zero) flags |= FSR4F_REACTIVE;
+            }
+            else
+            {
+                DetachOpaqueCapture();
+            }
 
             int slot = Time.frameCount & 3;
 
             Fsr4SetEyeFrameParams(
                 eye, slot,
-                colorPtr, depthPtr, motionPtr, outPtr,
+                colorPtr, depthPtr, motionPtr, outPtr, opaquePtr,
                 renderW, renderH, outW, outH,
                 jitterX, jitterY, mvScaleX, mvScaleY,
                 camNear, camFar, fovY,
@@ -262,15 +301,19 @@ namespace FSR4Bridge.Source
             _cmd.IssuePluginEvent(_renderEventFunc, (slot << 1) | eye);
             UnityEngine.Graphics.ExecuteCommandBuffer(_cmd);
 
-            // Diagnostic: is the jitter sane (non-zero, changing each frame)? A stuck/zero jitter =
-            // a soft, spatial-only upscale. Logs a handful of frames spaced out, then stops.
-            if (Fsr4Config.DebugLog.Value && _debugLogsLeft > 0 && (Time.frameCount % 90 == 0))
+            // Re-arm a fresh batch of logs each time Debug Log is toggled off→on (so you can pull logs
+            // again without a restart). % 89 (prime) so the sampling doesn't alias with the jitter period.
+            bool dbg = Fsr4Config.DebugLog.Value;
+            if (dbg && !_prevDebugLog) _debugLogsLeft = 8;
+            _prevDebugLog = dbg;
+            if (dbg && _debugLogsLeft > 0 && (Time.frameCount % 89 == 0))
             {
                 _debugLogsLeft--;
                 Plugin.MyLog.LogInfo(
-                    $"[FSR4] params: {(vr ? "VR eye" + eye : "flat")} render {renderW}x{renderH} -> {outW}x{outH} " +
-                    $"jitterPx=({jitter.x:F3},{jitter.y:F3}) fed=({jitterX:F3},{jitterY:F3}) " +
-                    $"mvScale=({mvScaleX:F0},{mvScaleY:F0}) dt={dtMs:F2}ms hdr={IsHdrFormat(source.format)} sharp={Fsr4Config.Sharpness.Value:F2}");
+                    $"[FSR4] {(vr ? "VR eye" + eye : "flat")} render {renderW}x{renderH}->{outW}x{outH} " +
+                    $"fed=({jitterX:F3},{jitterY:F3}) vrJitter=({vrJitter.x:F3},{vrJitter.y:F3}) " +
+                    $"gameJitter=({gameJitter.x:F3},{gameJitter.y:F3}) mvCancel={Fsr4Config.MvJitterCancel.Value}" +
+                    (vr ? $" | JITTER-MAG: assumed={GetVrAssumedRenderWidth()}x{GetVrAssumedRenderHeight()} vs actual={renderW}x{renderH}" : ""));
             }
 
             DrainLog();
@@ -295,7 +338,50 @@ namespace FSR4Bridge.Source
             return TarkovVR.Patches.Upscalers.VRJitterComponent.CurrentJitter;
         }
 
+        // The render width VRJitterComponent ASSUMES when it sizes the projection jitter. If this != the
+        // actual FSR renderW, the fed jitter magnitude is wrong → static sub-pixel edge misalignment.
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        private static int GetVrAssumedRenderWidth()
+        {
+            return TarkovVR.Patches.Upscalers.VRJitterComponent.LastScaledWidth;
+        }
+
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        private static int GetVrAssumedRenderHeight()
+        {
+            return TarkovVR.Patches.Upscalers.VRJitterComponent.LastScaledHeight;
+        }
+
         // -------------------------------------------------------------------------------------------
+        // Attach (once) a CommandBuffer that blits the opaque-only color — available at BeforeForwardAlpha,
+        // before transparency composites — into an owned RT, for the native reactive-mask generator.
+        private static void EnsureOpaqueCapture(Camera cam, int w, int h, RenderTextureFormat fmt)
+        {
+            bool rebuilt = _opaqueRT == null || _opaqueRT.width != w || _opaqueRT.height != h
+                        || _opaqueRT.format != fmt || !_opaqueRT.IsCreated();
+            EnsureCopyRT(ref _opaqueRT, w, h, fmt, "FSR4Opaque");
+            if (_opaqueCmd == null)
+                _opaqueCmd = new CommandBuffer { name = "FSR4OpaqueCapture" };
+            if (rebuilt || _opaqueCam != cam)
+            {
+                _opaqueCmd.Clear();
+                _opaqueCmd.Blit(new RenderTargetIdentifier(BuiltinRenderTextureType.CameraTarget), _opaqueRT);
+            }
+            if (_opaqueCam != cam)
+            {
+                if (_opaqueCam != null) _opaqueCam.RemoveCommandBuffer(CameraEvent.BeforeForwardAlpha, _opaqueCmd);
+                cam.AddCommandBuffer(CameraEvent.BeforeForwardAlpha, _opaqueCmd);
+                _opaqueCam = cam;
+            }
+        }
+
+        private static void DetachOpaqueCapture()
+        {
+            if (_opaqueCam != null && _opaqueCmd != null)
+                _opaqueCam.RemoveCommandBuffer(CameraEvent.BeforeForwardAlpha, _opaqueCmd);
+            _opaqueCam = null;
+        }
+
         private static void EnsureCopyRT(ref RenderTexture rt, int w, int h, RenderTextureFormat fmt, string name)
         {
             if (rt != null && rt.width == w && rt.height == h && rt.format == fmt && rt.IsCreated())

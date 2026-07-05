@@ -3,3 +3,4 @@ obj/
 .vs/
 native/build/
 *.user
+libs/

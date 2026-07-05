@@ -3,35 +3,38 @@ using BepInEx.Configuration;
 
 namespace FSR4Bridge.Source
 {
-    // Marker read by the ConfigurationManager UI to fold advanced entries away by default.
     internal sealed class ConfigurationManagerAttributes
     {
+        public int? Order;
         public bool? IsAdvanced;
     }
 
+    public enum EUpscaler { FSR4, FSR3_1 }
+
     internal static class Fsr4Config
     {
-        public static ConfigEntry<bool>  Enabled;
-        public static ConfigEntry<float> Sharpness;
+        public static ConfigEntry<EUpscaler> Upscaler;
+        public static ConfigEntry<bool>      Enabled;
+        public static ConfigEntry<float>     Sharpness;
+        public static ConfigEntry<float>     JitterScale;
+        public static ConfigEntry<bool>      DepthInfinite;
+        public static ConfigEntry<bool>      ReactiveMask;
+        public static ConfigEntry<bool>      NativeAA;
 
-        // Advanced correctness knobs — defaults follow the game's FSR conventions and normally need no
-        // change. Exposed so a bad-looking result can be A/B'd without a rebuild.
-        public static ConfigEntry<bool>  PreferFsr4;
-        public static ConfigEntry<bool>  AutoExposure;
-        public static ConfigEntry<bool>  DepthInverted;
-        public static ConfigEntry<bool>  InvertMotionVectors;
+        public static ConfigEntry<bool>      DebugLog;
+        public static ConfigEntry<bool>      VrUseGameJitter;
+        public static ConfigEntry<bool>      MvJitterCancel;
+        public static ConfigEntry<bool>      VrFlipJitterX;
+        public static ConfigEntry<bool>      VrFlipJitterY;
 
-        // Jitter tuning — flatscreen reads the game's jitter (TemporalAntialiasing.jitterPixelSpace)
-        // instead of controlling it like VR does, so the sign/scale may need to be dialed in. Wrong
-        // jitter = a soft, spatial-only upscale (no temporal detail).
-        public static ConfigEntry<float> JitterScale;
-        public static ConfigEntry<bool>  JitterFlipX;
-        public static ConfigEntry<bool>  JitterFlipY;
-        public static ConfigEntry<bool>  DebugLog;
-
-        private static ConfigDescription Adv(string desc, AcceptableValueBase range = null)
+        private static ConfigDescription Ordered(string desc, int order, AcceptableValueBase range = null)
         {
-            return new ConfigDescription(desc, range, new ConfigurationManagerAttributes { IsAdvanced = true });
+            return new ConfigDescription(desc, range, new ConfigurationManagerAttributes { Order = order });
+        }
+
+        private static ConfigDescription Advanced(string desc, int order = 0, AcceptableValueBase range = null)
+        {
+            return new ConfigDescription(desc, range, new ConfigurationManagerAttributes { Order = order, IsAdvanced = true });
         }
 
         public static void Bind(ConfigFile config)
@@ -49,43 +52,44 @@ namespace FSR4Bridge.Source
                 Plugin.MyLog.LogInfo($"Config reset for version {currentVersion}");
             }
 
+            Upscaler = config.Bind("FSR4", "Upscaler", EUpscaler.FSR4,
+                Ordered("Choose which upscaler you would like to use, 3.1.x will use your current default in Adrenalin.", 4));
+
             Enabled = config.Bind("FSR4", "Enable FSR4", true,
-                "Route the game's FSR upscaler to AMD FSR4 (or the latest FSR 3.1.x on non-RDNA4 GPUs). " +
-                "REQUIRES an FSR quality mode selected in the in-game Graphics settings — that's what turns " +
-                "upscaling on; this just swaps the upscaler. Needs an AMD GPU with a recent driver for true FSR4.");
+                Ordered("Enables FSR4, if this is disabled, the game will switch back to base FSR3.0", 3));
 
             Sharpness = config.Bind("FSR4", "Sharpness", 0.5f,
-                new ConfigDescription("RCAS sharpening applied after upscaling. FSR4's ML model is smoother " +
-                    "than FSR3 by design (more stable in motion, softer at rest), and swapping it in bypasses " +
-                    "the game's own FSR3 sharpen pass — so raise this (0.6–0.9) if edges look soft. 0 = off.",
-                    new AcceptableValueRange<float>(0f, 1f)));
+                Ordered("RCAS sharpening applied after upscaling.", 2, new AcceptableValueRange<float>(0f, 1f)));
 
-            PreferFsr4 = config.Bind("Advanced", "Prefer FSR4", true,
-                Adv("On: use the FSR4 provider when the driver exposes it. Off: force the default FSR 3.1.x " +
-                    "provider (useful for A/B comparison)."));
-            AutoExposure = config.Bind("Advanced", "Auto Exposure", true,
-                Adv("Let FSR compute its own exposure. Turn off only if the image is over/under-exposed."));
-            DepthInverted = config.Bind("Advanced", "Depth Inverted", true,
-                Adv("Unity uses reversed-Z depth on D3D (default). If you get heavy ghosting / no disocclusion " +
-                    "handling, toggle this."));
-            InvertMotionVectors = config.Bind("Advanced", "Invert Motion Vectors", true,
-                Adv("Negate the motion-vector direction (matches the game's FSR3 convention). If moving/turning " +
-                    "smears the image, toggle this."));
-
-            JitterScale = config.Bind("Advanced", "Jitter Scale", 1.0f,
-                Adv("Multiplier on the camera jitter fed to FSR. If the image is soft/blurry (temporal detail " +
-                    "never builds up), the jitter magnitude may be off — try 0.5 or 2.0.",
+            JitterScale = config.Bind("FSR4", "Jitter Scale", 1.0f,
+                Ordered("Multiplier on the camera jitter fed to FSR. Leave at 1.0 unless the image is soft " +
+                    "(temporal detail never builds up) — then try 0.5 or 2.0.", 1,
                     new AcceptableValueRange<float>(0.1f, 4f)));
-            // Default ON: the game's jitterPixelSpace uses the OPPOSITE sign convention to what FSR
-            // wants in flatscreen (confirmed in-game — with these off the image is soft/no temporal
-            // detail). Left as toggles in case a setup differs.
-            JitterFlipX = config.Bind("Advanced", "Jitter Flip X", true,
-                Adv("Flip the horizontal jitter sign (A/B if the image is soft or shimmery)."));
-            JitterFlipY = config.Bind("Advanced", "Jitter Flip Y", true,
-                Adv("Flip the vertical jitter sign (A/B if the image is soft or shimmery)."));
-            DebugLog = config.Bind("Advanced", "Debug Log", false,
-                Adv("Log the per-frame FSR params (jitter, sizes, dt) to the BepInEx console a few times " +
-                    "so you can check the jitter is non-zero and changing each frame."));
+
+            NativeAA = config.Bind("FSR4", "Native AA", false,
+                Ordered("Render at native resolution and use FSR4 for AA", 0));
+
+            DepthInfinite = config.Bind("Debug", "Depth Infinite Far Plane", true,
+                Advanced("This tells FSR the far plane is at infinity — fixes edge shimmer on objects silhouette"));
+
+            ReactiveMask = config.Bind("Debug", "Reactive Mask", true,
+                Advanced("Auto-generate a reactive mask each frame (captures the opaque-only color and compares) " +
+                "Can improve clarity over moving particles and edges"));
+
+            DebugLog = config.Bind("Debug", "Debug Log", false,
+                Advanced("Log per-frame FSR jitter/sizes to the BepInEx console."));
+
+            VrUseGameJitter = config.Bind("Debug", "VR Only - Disable jitter", false,
+                Advanced("Feed FSR the game's TemporalAntialiasing.jitterPixelSpace which is zero'd in SPT-VR"));
+
+            MvJitterCancel = config.Bind("Debug", "MV Jitter Cancellation", false,
+                Advanced("Experiment: tell FSR the motion vectors already contain the jitter (it subtracts it). "));
+
+            VrFlipJitterX = config.Bind("Debug", "VR Only - Jitter Flip X", false,
+                Advanced("Flips jitter on the X axis"));
+
+            VrFlipJitterY = config.Bind("Debug", "VR Only - Jitter Flip Y", true,
+                Advanced("Flips jitter on the Y axis"));
         }
     }
 }

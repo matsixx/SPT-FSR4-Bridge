@@ -1,33 +1,13 @@
-# FSR4 Bridge — AMD FSR4 for Single Player Tarkov (flatscreen)
+# FSR4 Bridge — AMD FSR4 for SPT
 
-Routes the game's FSR upscaler to **AMD FSR4** (or the latest **FSR 3.1.x** on non-RDNA4 GPUs) via a
-native D3D11→D3D12 bridge. Tarkov/Unity render on D3D11; FSR4 and the modern FidelityFX providers are
-D3D12-only, so the bridge stands up a private D3D12 device, shares the render-res textures across a
-timeline fence, runs `ffxDispatch`, and copies the result back — all on the render thread, no CPU stall.
-
-## Install
-
-Drop the `FSR4Bridge` folder into `BepInEx/plugins/`:
-
-```
-BepInEx/plugins/FSR4Bridge/
-  FSR4Bridge.dll
-  native/
-    FSR4Native.dll
-    amd_fidelityfx_loader_dx12.dll
-    amd_fidelityfx_upscaler_dx12.dll
-```
+Routes the game's FSR3 upscaler to **AMD FSR4** (or the latest **FSR 3.1.x** as a fallback) via a
+native D3D11→D3D12 bridge. This is built using the latest FSR SDK, so it supports FSR 4.1.1 which works with RDNA3.
 
 ## Use
 
-1. In the game's **Graphics** settings, select an **FSR** quality mode (this is what enables upscaling
-   and the render-res downscale — FSR4 Bridge just swaps the upscaler).
+1. In the game's **Graphics** settings, select an **FSR3** quality mode
 2. In the BepInEx **config** (F12 ConfigurationManager, or edit
    `BepInEx/config/com.matsix.fsr4bridge.cfg`), set **Enable FSR4 = true**.
-
-True **FSR4** requires an **AMD RDNA4 GPU** (e.g. RX 9070) with a recent driver — it's delivered by the
-driver's `amdxcffx64.dll`, which the loader finds at runtime. On other GPUs it transparently uses the
-bundled native **FSR 3.1.x** provider. Watch the BepInEx log for `[FSR4] active provider: ...`.
 
 ## Config
 
