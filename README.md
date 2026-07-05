@@ -14,16 +14,11 @@ native D3D11→D3D12 bridge. This is built using the latest FSR SDK, so it suppo
 - **Enable FSR4** — the master toggle.
 - **Sharpness** (0–1) — RCAS post-sharpen. FSR4 is smoother than FSR3 by design (bypassing the game's
   own FSR3 sharpen pass too), so raise this (~0.6–0.9) if edges look soft.
-- *Advanced:* **Prefer FSR4** (off = force 3.1.x for A/B), **Auto Exposure**, **Depth Inverted**,
-  **Invert Motion Vectors**, and **Jitter Scale / Flip X / Flip Y** — correctness knobs. Defaults are
-  tuned for EFT; the jitter flips default ON because the game's jitter uses the opposite sign FSR wants.
 
-## Coexistence with SPT-VR
+## SPT-VR Support
 
-The SPT-VR mod ships its own VR-tuned FSR4 integration. If it's installed, **FSR4 Bridge detects it and
-stands down** (via a soft dependency) so the two never double-patch the upscaler — VR keeps working,
-FSR4 Bridge only owns flatscreen. (The VR mod is VR-only, so there's no practical "flatscreen with the
-VR mod" case; to run FSR4 Bridge, use a build without the VR mod loaded.)
+You will need to be on version 1.3.1+ of SPT-VR for this bridge more to work. I had to add special support for the VR mod since it changes
+a lot of upscaler code.
 
 ## Building
 
