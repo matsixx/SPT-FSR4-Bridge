@@ -1,21 +1,22 @@
-# FSR4 Bridge — AMD FSR4 for SPT
+# FSR4 Bridge - AMD FSR4 for SPT
 
 Routes the game's FSR3 upscaler to **AMD FSR4** (or the latest **FSR 3.1.x** as a fallback) via a
-native D3D11→D3D12 bridge. This is built using the latest FSR SDK, so it supports FSR 4.1.1 which works with RDNA3.
+native D3D11 -> D3D12 bridge. This is built using the latest FSR SDK, so it supports FSR 4.1.1 which works with RDNA3.
 
 If your card does not support FSR4 and you select it, it will auto fallback to 3.1.x.
 
-## Use
+## How to Use
 
 1. In the game's **Graphics** settings, select an **FSR3** quality mode
 2. In the BepInEx **config** (F12 ConfigurationManager, or edit
    `BepInEx/config/com.matsix.fsr4bridge.cfg`), set **Enable FSR4 = true**.
 
-## Config
+## BepInEx Config
 
-- **Enable FSR4** — the master toggle.
-- **Sharpness** (0–1) — RCAS post-sharpen. FSR4 is smoother than FSR3 by design (bypassing the game's
+- **Enable FSR4** - the master toggle.
+- **Sharpness** (0–1) - RCAS post-sharpen. FSR4 is smoother than FSR3 by design (bypassing the game's
   own FSR3 sharpen pass too), so raise this (~0.6–0.9) if edges look soft.
+- **Native AA** - Toggle between native resolution AA and upscaled AA
 
 ## SPT-VR Support
 
@@ -25,4 +26,7 @@ a lot of upscaler code.
 ## Credits
 
 - AMD Fidelity FX SDK - https://gpuopen.com/amd-fidelityfx-sdk/
-- Claude code for a lot of the bridge logic
+- Claude for a lot of the bridge logic
+
+You can support my work on Ko-fi:
+https://ko-fi.com/matsix
