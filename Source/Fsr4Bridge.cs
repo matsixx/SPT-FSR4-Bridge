@@ -189,7 +189,6 @@ namespace FSR4Bridge.Source
                 }
             }
 
-            // Detects if SPT-VR is present (soft-dep) so we can fetch the VRJitterComponent's jitter from SPT-VR.
             bool vr = SptVrPresent;
             int eye = ((int)cam.stereoActiveEye) & 1;
 
@@ -350,17 +349,12 @@ namespace FSR4Bridge.Source
             return true;
         }
 
-        // Typed access to SPT-VR's jitter. NoInlining + the SptVrPresent gate mean this method is only
-        // ever JITted when SPT-VR is loaded, so the flatscreen-only case never tries to resolve the VR
-        // type (would throw at JIT). Mirrors the VR mod's own soft-dep pattern (see OrbitSupport).
         [MethodImpl(MethodImplOptions.NoInlining)]
         private static Vector2 GetVrJitter()
         {
             return TarkovVR.Patches.Upscalers.VRJitterComponent.CurrentJitter;
         }
 
-        // The render width VRJitterComponent ASSUMES when it sizes the projection jitter. If this != the
-        // actual FSR renderW, the fed jitter magnitude is wrong → static sub-pixel edge misalignment.
         [MethodImpl(MethodImplOptions.NoInlining)]
         private static int GetVrAssumedRenderWidth()
         {

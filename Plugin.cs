@@ -7,7 +7,7 @@ using FSR4Bridge.Source;
 namespace FSR4Bridge
 {
     [BepInDependency("com.matsix.sptvr", BepInDependency.DependencyFlags.SoftDependency)]
-    [BepInPlugin("com.matsix.fsr4bridge", "FSR4 Bridge", "1.0.0")]
+    [BepInPlugin("com.matsix.fsr4bridge", "FSR4 Bridge", "1.0.1")]
     public class Plugin : BaseUnityPlugin
     {
         public static ManualLogSource MyLog;

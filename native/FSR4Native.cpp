@@ -99,6 +99,25 @@ static void Log(const char* fmt, ...)
 static std::atomic<bool> gVerbose{false};
 #define LogV(...) do { if (gVerbose.load()) Log(__VA_ARGS__); } while (0)
 
+// ---- render-thread phase profiler (Debug Log only) --------------------------------------------
+// The whole DoRenderEvent runs on Unity's render thread (via IssuePluginEvent), so its total CPU
+// time is added per-eye per-frame to the render thread — and on this CPU-bound game that converts
+// ~1:1 to lost fps. This buckets each completed event so we can see WHERE the cost is: render-thread
+// CPU (flush/allocStall/record) vs GPU serialization (big total, small CPU buckets). Only active
+// when Debug Log (gVerbose) is on; single-threaded (render thread) so no locking. Logged every N.
+enum PhaseId { PH_SETUP, PH_COPIES, PH_FLUSH, PH_ALLOCSTALL, PH_RECORD, PH_SUBMIT, PH_TOTAL, PH_COUNT };
+static double        gPhaseAccum[PH_COUNT] = {};
+static int           gPhaseSamples = 0;
+static const int     kPhaseLogEvery = 200;
+static LARGE_INTEGER gQpcFreq = {};
+
+static inline double NowMs()
+{
+    if (gQpcFreq.QuadPart == 0) QueryPerformanceFrequency(&gQpcFreq);
+    LARGE_INTEGER t; QueryPerformanceCounter(&t);
+    return (double)t.QuadPart * 1000.0 / (double)gQpcFreq.QuadPart;
+}
+
 static void LogW(const wchar_t* prefix, const wchar_t* msg)
 {
     char narrow[900];
@@ -683,7 +702,10 @@ static bool CreateEyeContext(Eye& eye, UINT outW, UINT outH, int flags)
 
     eye.ctxOutW = outW;
     eye.ctxOutH = outH;
-    eye.ctxFlags = flags & ~FSR4F_RESET;
+    // MUST match the needCtxRebuild comparison mask (DoRenderEvent) exactly — FSR4F_REACTIVE is per-dispatch,
+    // not a context flag. If this stored value keeps a bit the comparison drops, they never match while that
+    // bit is set → the context rebuilds EVERY FRAME (catastrophic perf).
+    eye.ctxFlags = flags & ~(FSR4F_RESET | FSR4F_REACTIVE);
     eye.firstDispatch = true;
     return true;
 }
@@ -822,6 +844,12 @@ static void DoRenderEvent(int eventId)
     if (!p.colorTex || !p.depthTex || !p.mvecTex || !p.outTex)
         return;
 
+    // Phase profiler (Debug Log only): capture per-boundary deltas, accumulated at the end for
+    // COMPLETED frames only — an early return just discards these locals (no half-frame skew).
+    bool prof = gVerbose.load();
+    double tStart = prof ? NowMs() : 0.0, tPrev = tStart;
+    double tSetup = 0, tCopies = 0, tFlush = 0, tAllocStall = 0, tRecord = 0, tSubmit = 0;
+
     ComPtr<ID3D11Texture2D> colorTex, depthTex, mvecTex, outTex;
     ((IUnknown*)p.colorTex)->QueryInterface(IID_PPV_ARGS(&colorTex));
     ((IUnknown*)p.depthTex)->QueryInterface(IID_PPV_ARGS(&depthTex));
@@ -846,16 +874,21 @@ static void DoRenderEvent(int eventId)
     if (gStatus == FSR4_NO_VERSIONS)
         return;
 
-    // Before tearing down / recreating any shared texture or the context on a RESIZE, idle the GPU —
-    // freeing a resource the GPU is still using is an AMD driver TDR (device removed). This bites
-    // specifically on the SteamVR-dashboard resolution drop at NATIVE AA: there render size == output
-    // size, so the OUTPUT shrinks too, forcing a context + output-texture rebuild that the normal
-    // upscaling path never triggers (there the output stays fixed and only the render shrinks).
-    if (e.ctx && ((UINT)p.outW != e.ctxOutW || (UINT)p.outH != e.ctxOutH
-                  || (e.color.tex11 && (UINT)p.renderW != e.color.width)))
-    {
+    // FSR4F_REACTIVE is a PER-DISPATCH flag (whether we feed a reactive mask), NOT an ffx context flag —
+    // excluding it (like FSR4F_RESET) means toggling the Reactive Mask config no longer needlessly tears
+    // down + rebuilds the context. That rebuild was the driver crash: destroying the context mid-flight is
+    // an AMD TDR (DEVICE_HUNG 0x887A0006).
+    int ctxFlags = p.flags & ~(FSR4F_RESET | FSR4F_REACTIVE);
+    bool needCtxRebuild = !e.ctx || e.ctxOutW != (UINT)p.outW || e.ctxOutH != (UINT)p.outH || e.ctxFlags != ctxFlags;
+
+    // Idle the GPU before tearing down / recreating any shared texture OR the context — freeing a resource
+    // the GPU is still using is a TDR. Fires on a resolution change AND on any context rebuild (a flags
+    // change that maps to an ffx context flag), but only when something actually changes, so it's free on
+    // normal frames. (Previously it only covered resize, which is why the flags-change rebuild crashed.)
+    bool sizeChanged = e.ctx && ((UINT)p.outW != e.ctxOutW || (UINT)p.outH != e.ctxOutH
+                                 || (e.color.tex11 && (UINT)p.renderW != e.color.width));
+    if (e.ctx && (sizeChanged || needCtxRebuild))
         WaitQueueIdle();
-    }
 
     if (!EnsureSharedTex(e.color, colorTex.Get(), false, "color") ||
         !EnsureSharedTex(e.depth, depthTex.Get(), false, "depth") ||
@@ -869,8 +902,7 @@ static void DoRenderEvent(int eventId)
         return;
     }
 
-    int ctxFlags = p.flags & ~FSR4F_RESET;
-    if (!e.ctx || e.ctxOutW != (UINT)p.outW || e.ctxOutH != (UINT)p.outH || e.ctxFlags != ctxFlags)
+    if (needCtxRebuild)
     {
         if (!CreateEyeContext(e, p.outW, p.outH, p.flags))
             return;
@@ -886,6 +918,8 @@ static void DoRenderEvent(int eventId)
             wantReactive = false;
     }
 
+    if (prof) { double n = NowMs(); tSetup = n - tPrev; tPrev = n; }
+
     // --- D3D11: copy this frame's inputs into the shared textures, then hand off to D3D12.
     gCtx11->CopyResource(e.color.tex11.Get(), colorTex.Get());
     gCtx11->CopyResource(e.depth.tex11.Get(), depthTex.Get());
@@ -893,10 +927,14 @@ static void DoRenderEvent(int eventId)
     if (wantReactive)
         gCtx11->CopyResource(e.opaque.tex11.Get(), opaqueTex.Get());
 
+    if (prof) { double n = NowMs(); tCopies = n - tPrev; tPrev = n; }
+
     UINT64 handoff = ++gFenceValue;
     gCtx11_4->Signal(gFence11.Get(), handoff);
     gCtx11->Flush();
     gQueue->Wait(gFence12.Get(), handoff);
+
+    if (prof) { double n = NowMs(); tFlush = n - tPrev; tPrev = n; }
 
     // --- D3D12: record + dispatch the upscale.
     int  ai = e.allocIdx;
@@ -906,6 +944,8 @@ static void DoRenderEvent(int eventId)
         gFence12->SetEventOnCompletion(e.allocFence[ai], gFenceEvent);
         WaitForSingleObject(gFenceEvent, 2000);
     }
+    if (prof) { double n = NowMs(); tAllocStall = n - tPrev; tPrev = n; }
+
     e.alloc[ai]->Reset();
     e.cmdList->Reset(e.alloc[ai].Get(), nullptr);
 
@@ -981,6 +1021,7 @@ static void DoRenderEvent(int eventId)
         return;
     }
     e.firstDispatch = false;
+    if (prof) { double n = NowMs(); tRecord = n - tPrev; tPrev = n; }
 
     e.cmdList->Close();
     ID3D12CommandList* lists[] = {e.cmdList.Get()};
@@ -993,6 +1034,28 @@ static void DoRenderEvent(int eventId)
     // --- D3D11: wait for the upscale on the GPU timeline, then copy into Unity's output RT.
     gCtx11_4->Wait(gFence11.Get(), done);
     gCtx11->CopyResource(outTex.Get(), e.output.tex11.Get());
+
+    if (prof)
+    {
+        double n = NowMs();
+        tSubmit = n - tPrev;
+        gPhaseAccum[PH_SETUP]      += tSetup;
+        gPhaseAccum[PH_COPIES]     += tCopies;
+        gPhaseAccum[PH_FLUSH]      += tFlush;
+        gPhaseAccum[PH_ALLOCSTALL] += tAllocStall;
+        gPhaseAccum[PH_RECORD]     += tRecord;
+        gPhaseAccum[PH_SUBMIT]     += tSubmit;
+        gPhaseAccum[PH_TOTAL]      += (n - tStart);
+        if (++gPhaseSamples >= kPhaseLogEvery)
+        {
+            double d = (double)gPhaseSamples;
+            Log("[FSR4] render-thread avg/event over %d (ms): total=%.3f | setup=%.3f copies=%.3f flush=%.3f allocStall=%.3f record=%.3f submit=%.3f",
+                gPhaseSamples, gPhaseAccum[PH_TOTAL]/d, gPhaseAccum[PH_SETUP]/d, gPhaseAccum[PH_COPIES]/d,
+                gPhaseAccum[PH_FLUSH]/d, gPhaseAccum[PH_ALLOCSTALL]/d, gPhaseAccum[PH_RECORD]/d, gPhaseAccum[PH_SUBMIT]/d);
+            for (int i = 0; i < PH_COUNT; i++) gPhaseAccum[i] = 0.0;
+            gPhaseSamples = 0;
+        }
+    }
 
     if (gStatus == FSR4_DISPATCH_FAILED || gStatus == FSR4_NOT_INITIALIZED)
         gStatus = FSR4_OK;
