@@ -16,6 +16,9 @@ namespace FSR4Bridge.Patches
                 new Type[] { typeof(RenderTexture), typeof(RenderTexture), typeof(CommandBuffer) });
         }
 
+        private static SSAAImpl _lastImpl;
+        private static Camera _lastCam;
+
         // High priority so we run BEFORE SPT-VR's own FSR3-wrapper prefix on this method. When we
         // handle the frame we return false; SPT-VR's prefix then sees __runOriginal == false and bails.
         [PatchPrefix]
@@ -28,8 +31,12 @@ namespace FSR4Bridge.Patches
 
             if (Fsr4Config.Enabled.Value)
             {
-                Camera cam = __instance.GetComponent<Camera>();
-                if (Fsr4Bridge.RenderEye(source, destination, cam))
+                if (!ReferenceEquals(__instance, _lastImpl))
+                {
+                    _lastImpl = __instance;
+                    _lastCam  = __instance.GetComponent<Camera>();
+                }
+                if (Fsr4Bridge.RenderEye(source, destination, _lastCam))
                 {
                     __result = true;
                     return false;

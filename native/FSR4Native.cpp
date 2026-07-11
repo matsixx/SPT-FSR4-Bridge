@@ -71,6 +71,7 @@ enum Fsr4Flags : int
     FSR4F_RESET           = 1 << 7,  // per-frame history reset request
     FSR4F_MV_JITTER_CANCEL = 1 << 8, // motion vectors have the jitter baked in (FSR removes it)
     FSR4F_REACTIVE        = 1 << 9,  // opaque-only color supplied → auto-generate + feed a reactive mask
+    FSR4F_MODEL_FIX       = 1 << 10, // force the stable FSR4 ML model at Quality-range ratios (createModel hook)
 };
 
 // ---------------------------------------------------------------- logging (drained by C# into BepInEx log)
@@ -175,6 +176,169 @@ static void SafeFfxDestroyContext(ffxContext* ctx)
 {
     __try { pfnDestroyContext(ctx, nullptr); }
     __except (EXCEPTION_EXECUTE_HANDLER) { }
+}
+
+// ---------------------------------------------------------------------------------------------------
+// FSR4 model-selection fix.
+// The FSR4 provider ships multiple ML models and picks one from a quality "preset". At Quality-range
+// ratios (>= ~1.29x) preset 0's selection is unstable — the reconstruction oscillates frame to frame
+// and edges wobble as if the jitter were misaligned (confirmed in VR: the wobble vanishes under the
+// FSR 3.1 provider and at 1.0x ratio). The public ffx-api doesn't expose model selection, so we
+// detour the provider's internal createModel(context, preset, model) — located by signature in
+// amdxcffx64 2.3.0 / amd_fidelityfx_upscaler_dx12 4.1.1 (the versions we target) — and bump
+// preset 0 -> 1 (the stable model) while the current ratio is in the bad window. Technique per
+// OptiScaler's FSR4ModelSelection; implementation is our own. All createModel calls originate on the
+// render thread inside our SafeFfx* SEH scopes, and hooks install on that same thread before the
+// context exists, so there's no concurrent-patch or unguarded-crash window.
+
+typedef uint64_t (*PfnCreateModel2)(void* context, uint32_t preset, void** model);
+
+static std::atomic<bool>     gModelFixEnabled{false};
+static std::atomic<float>    gModelFixRatio{1.0f};
+static std::atomic<uint32_t> gModelPresetSeen{0xFFFFFFFF};
+static std::atomic<uint32_t> gModelPresetUsed{0xFFFFFFFF};
+static uint32_t gModelPresetLoggedSeen = 0xFFFFFFFF, gModelPresetLoggedUsed = 0xFFFFFFFF;
+
+// createModel prologue, amdxcffx64 2.3.0 / amd_fidelityfx_upscaler_dx12 4.1.1.2740.
+static const char* kCreateModelPattern =
+    "48 8B C4 48 89 58 ? 55 56 57 41 54 41 55 41 56 41 57 48 8D A8 ? ? ? ? 48 81 EC ? ? ? ? "
+    "0F 29 70 ? 0F 29 78 ? 48 8B 05 ? ? ? ? 48 33 C4 48 89 85 ? ? ? ? 4D 8B E8 8B FA 48 8B";
+
+struct ModelHook { uint8_t* target; PfnCreateModel2 trampoline; };
+static ModelHook gModelHooks[2] = {};
+static int       gModelHookCount = 0;
+
+// IDA-style pattern scan over a module's executable sections.
+static uint8_t* FindPattern(HMODULE mod, const char* pattern)
+{
+    if (!mod) return nullptr;
+    uint8_t bytes[128]; uint8_t care[128]; int n = 0;
+    for (const char* p = pattern; *p && n < 128;)
+    {
+        if (*p == ' ') { p++; continue; }
+        if (*p == '?') { bytes[n] = 0; care[n] = 0; n++; p++; if (*p == '?') p++; continue; }
+        auto hex = [](char c) -> int {
+            if (c >= '0' && c <= '9') return c - '0';
+            if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+            if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+            return -1;
+        };
+        int hi = hex(p[0]), lo = hex(p[1]);
+        if (hi < 0 || lo < 0) return nullptr;
+        bytes[n] = (uint8_t)((hi << 4) | lo); care[n] = 1; n++; p += 2;
+    }
+    if (n == 0) return nullptr;
+
+    auto base = (uint8_t*)mod;
+    auto dos  = (PIMAGE_DOS_HEADER)base;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return nullptr;
+    auto nt = (PIMAGE_NT_HEADERS)(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return nullptr;
+    auto sec = IMAGE_FIRST_SECTION(nt);
+    for (WORD s = 0; s < nt->FileHeader.NumberOfSections; s++, sec++)
+    {
+        if (!(sec->Characteristics & IMAGE_SCN_MEM_EXECUTE)) continue;
+        uint8_t* start = base + sec->VirtualAddress;
+        SIZE_T   size  = sec->Misc.VirtualSize;
+        if (size < (SIZE_T)n) continue;
+        for (SIZE_T i = 0; i + n <= size; i++)
+        {
+            SIZE_T j = 0;
+            while (j < (SIZE_T)n && (!care[j] || start[i + j] == bytes[j])) j++;
+            if (j == (SIZE_T)n) return start + i;
+        }
+    }
+    return nullptr;
+}
+
+static uint32_t CorrectModelPreset(uint32_t preset)
+{
+    uint32_t corrected = preset;
+    if (gModelFixEnabled.load(std::memory_order_relaxed) && preset == 0 &&
+        gModelFixRatio.load(std::memory_order_relaxed) >= 1.29f)
+        corrected = 1;
+    gModelPresetSeen.store(preset, std::memory_order_relaxed);
+    gModelPresetUsed.store(corrected, std::memory_order_relaxed);
+    return corrected;
+}
+
+// One hook fn per patched module (SDK dll + driver dll can both carry the function).
+static uint64_t HookCreateModel0(void* c, uint32_t preset, void** m) { return gModelHooks[0].trampoline(c, CorrectModelPreset(preset), m); }
+static uint64_t HookCreateModel1(void* c, uint32_t preset, void** m) { return gModelHooks[1].trampoline(c, CorrectModelPreset(preset), m); }
+
+static int InstallModelHooksImpl()
+{
+    static const wchar_t* kMods[2] = { L"amdxcffx64.dll", L"amd_fidelityfx_upscaler_dx12.dll" };
+    static bool scanned[2] = {};
+    int installed = 0;
+    for (int i = 0; i < 2 && gModelHookCount < 2; i++)
+    {
+        if (scanned[i]) continue;
+        HMODULE mod = GetModuleHandleW(kMods[i]);
+        if (!mod) continue;        // not loaded yet — a later call retries
+        scanned[i] = true;         // a loaded module is scanned exactly once
+        uint8_t* fn = FindPattern(mod, kCreateModelPattern);
+        if (!fn)
+        {
+            Log("[FSR4] model-fix: createModel signature not found in %ws (unexpected provider version?)", kMods[i]);
+            continue;
+        }
+        bool dup = false;
+        for (int h = 0; h < gModelHookCount; h++)
+            if (gModelHooks[h].target == fn) dup = true;
+        if (dup) continue;
+
+        uint8_t* tramp = (uint8_t*)VirtualAlloc(nullptr, 64, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+        if (!tramp) continue;
+        // The first 12 matched bytes (mov rax,rsp / mov [rax+d],rbx / push rbp,rsi,rdi / push r12) are
+        // position-independent and end on an instruction boundary — safe to relocate verbatim.
+        memcpy(tramp, fn, 12);
+        tramp[12] = 0xFF; tramp[13] = 0x25;             // jmp [rip+0]
+        *(uint32_t*)(tramp + 14) = 0;
+        *(uint64_t*)(tramp + 18) = (uint64_t)(fn + 12);
+
+        int slot = gModelHookCount;
+        gModelHooks[slot].target     = fn;
+        gModelHooks[slot].trampoline = (PfnCreateModel2)tramp;   // live before the entry patch
+        void* hookFn = slot == 0 ? (void*)&HookCreateModel0 : (void*)&HookCreateModel1;
+
+        DWORD old;
+        if (!VirtualProtect(fn, 16, PAGE_EXECUTE_READWRITE, &old))
+        {
+            gModelHooks[slot] = {};
+            VirtualFree(tramp, 0, MEM_RELEASE);
+            continue;
+        }
+        uint8_t stub[12] = { 0x48, 0xB8, 0,0,0,0,0,0,0,0, 0xFF, 0xE0 };   // mov rax, imm64; jmp rax (rax is volatile at entry)
+        memcpy(stub + 2, &hookFn, 8);
+        memcpy(fn, stub, 12);
+        VirtualProtect(fn, 16, old, &old);
+        FlushInstructionCache(GetCurrentProcess(), fn, 16);
+
+        gModelHookCount = slot + 1;
+        installed++;
+        Log("[FSR4] model-fix: hooked createModel in %ws at %p", kMods[i], fn);
+    }
+    return installed;
+}
+
+// Object-free SEH wrapper (same rule as the SafeFfx shims).
+static int InstallModelHooksSafe()
+{
+    __try { return InstallModelHooksImpl(); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+
+static void LogModelPresetIfChanged()
+{
+    uint32_t seen = gModelPresetSeen.load(std::memory_order_relaxed);
+    uint32_t used = gModelPresetUsed.load(std::memory_order_relaxed);
+    if (seen == 0xFFFFFFFF || (seen == gModelPresetLoggedSeen && used == gModelPresetLoggedUsed))
+        return;
+    gModelPresetLoggedSeen = seen;
+    gModelPresetLoggedUsed = used;
+    Log("[FSR4] model preset %u -> %u (ratio %.2f%s)", seen, used,
+        gModelFixRatio.load(std::memory_order_relaxed), seen != used ? ", corrected" : "");
 }
 
 static ComPtr<ID3D11Device>          g11;
@@ -619,6 +783,9 @@ static bool CreateEyeContext(Eye& eye, UINT outW, UINT outH, int flags)
 {
     DestroyEyeContext(eye);
 
+    if (flags & FSR4F_MODEL_FIX)
+        InstallModelHooksSafe();   // providers are loaded by the version enumeration, so usually a no-op
+
     uint32_t ffxFlags = 0;
     if (flags & FSR4F_HDR)            ffxFlags |= FFX_UPSCALE_ENABLE_HIGH_DYNAMIC_RANGE;
     if (flags & FSR4F_DEPTH_INVERTED) ffxFlags |= FFX_UPSCALE_ENABLE_DEPTH_INVERTED;
@@ -686,6 +853,24 @@ static bool CreateEyeContext(Eye& eye, UINT outW, UINT outH, int flags)
         eye.ctx = nullptr;
         gStatus = FSR4_CONTEXT_FAILED;
         return false;
+    }
+
+    // If this create lazily loaded a provider dll, the pre-create install missed it and THIS context's
+    // model was chosen unhooked — hook now and recreate once so the correction actually applies.
+    if ((flags & FSR4F_MODEL_FIX) && InstallModelHooksSafe() > 0)
+    {
+        Log("[FSR4] model-fix: provider dll loaded during context create — recreating with hooks live");
+        WaitQueueIdle();
+        SafeFfxDestroyContext(&eye.ctx);
+        eye.ctx = nullptr;
+        rc = SafeFfxCreateContext(&eye.ctx, &desc.header);
+        if (rc != FFX_API_RETURN_OK)
+        {
+            Log("[FSR4] ffxCreateContext failed on model-fix recreate (rc=0x%X)", rc);
+            eye.ctx = nullptr;
+            gStatus = FSR4_CONTEXT_FAILED;
+            return false;
+        }
     }
 
     ffxQueryGetProviderVersion pv = {};
@@ -873,6 +1058,13 @@ static void DoRenderEvent(int eventId)
     QueryVersionsOnce();
     if (gStatus == FSR4_NO_VERSIONS)
         return;
+
+    // Live inputs for the createModel hook: whether the fix applies + the current upscale ratio.
+    // (FSR4F_MODEL_FIX stays IN ctxFlags below, so toggling it rebuilds the context = re-runs model
+    // selection with the new setting.)
+    gModelFixEnabled.store((p.flags & FSR4F_MODEL_FIX) != 0, std::memory_order_relaxed);
+    gModelFixRatio.store(p.renderW > 0 ? (float)p.outW / (float)p.renderW : 1.0f, std::memory_order_relaxed);
+    LogModelPresetIfChanged();
 
     // FSR4F_REACTIVE is a PER-DISPATCH flag (whether we feed a reactive mask), NOT an ffx context flag —
     // excluding it (like FSR4F_RESET) means toggling the Reactive Mask config no longer needlessly tears

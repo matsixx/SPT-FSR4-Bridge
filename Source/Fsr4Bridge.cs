@@ -25,6 +25,7 @@ namespace FSR4Bridge.Source
         private const int FSR4F_RESET          = 1 << 7;
         private const int FSR4F_MV_JITTER_CANCEL = 1 << 8;
         private const int FSR4F_REACTIVE       = 1 << 9;
+        private const int FSR4F_MODEL_FIX      = 1 << 10;
 
         private static bool _triedInit;
         private static bool _initOk;
@@ -39,7 +40,27 @@ namespace FSR4Bridge.Source
         private static readonly RenderTexture[] _colorRT  = new RenderTexture[2];
         private static readonly RenderTexture[] _depthRT  = new RenderTexture[2];
         private static readonly RenderTexture[] _motionRT = new RenderTexture[2];
-        private static CommandBuffer _cmd;
+
+        // Cached native texture pointers. GetNativeTexturePtr SYNCHRONIZES the main thread with the
+        // render thread under multithreaded rendering (Unity docs) — the stall lasts as long as the
+        // render thread is behind
+        private static readonly IntPtr[] _colorPtr  = new IntPtr[2];
+        private static readonly IntPtr[] _depthPtr  = new IntPtr[2];
+        private static readonly IntPtr[] _motionPtr = new IntPtr[2];
+        private static IntPtr _opaquePtr;
+        private static readonly RenderTexture[] _destRT  = new RenderTexture[2];
+        private static readonly IntPtr[]        _destPtr = new IntPtr[2];
+
+        // One immutable CommandBuffer per (slot,eye) event id — no Clear + re-record per frame.
+        private static readonly CommandBuffer[] _eventCmds = new CommandBuffer[8];
+        private static int _lastRenderEyeFrame = -1;
+
+        // Main-thread cost profiler (Debug Log only). RenderEye runs on the MAIN thread; its
+        // historical dominant cost (GetNativeTexturePtr render-thread syncs) was invisible to the
+        // native render-thread phase profiler, so this bucket is the one that shows it.
+        private static readonly System.Diagnostics.Stopwatch _mainSw = new System.Diagnostics.Stopwatch();
+        private static double _mainAccumMs;
+        private static int _mainSamples;
 
         // Reactive-mask capture: a CommandBuffer at BeforeForwardAlpha blits the opaque-only color into an
         // owned RT each frame (same technique the game's FSR3 wrapper uses), which we hand to the native
@@ -81,11 +102,13 @@ namespace FSR4Bridge.Source
         [DllImport(DLL, CallingConvention = CallingConvention.Cdecl)]
         private static extern int Fsr4IsFsr4Active();
 
+        // byte[] instead of StringBuilder: StringBuilder marshaling allocates a native buffer and
+        // copies both ways on EVERY call; a byte[] pins in place (zero allocation). Same char* ABI.
         [DllImport(DLL, CallingConvention = CallingConvention.Cdecl)]
-        private static extern int Fsr4GetActiveVersion(StringBuilder buf, int cap);
+        private static extern int Fsr4GetActiveVersion(byte[] buf, int cap);
 
         [DllImport(DLL, CallingConvention = CallingConvention.Cdecl)]
-        private static extern int Fsr4PopLogLine(StringBuilder buf, int cap);
+        private static extern int Fsr4PopLogLine(byte[] buf, int cap);
 
         [DllImport(DLL, CallingConvention = CallingConvention.Cdecl)]
         private static extern void Fsr4InvalidateContexts();
@@ -146,11 +169,19 @@ namespace FSR4Bridge.Source
         public static void InvalidateContexts()
         {
             _permaFail = false;
+            DetachOpaqueCapture();                 // don't leave the capture blit running while off
+            _destRT[0] = _destRT[1] = null;        // refetch destination ptr on next use
             if (_initOk)
             {
                 try { Fsr4InvalidateContexts(); } catch { }
                 DrainLog();
             }
+        }
+
+        public static void IdleTick()
+        {
+            if (_opaqueCam != null && Time.frameCount - _lastRenderEyeFrame > 120)
+                DetachOpaqueCapture();
         }
 
         // Called from Fsr4RenderPatch in place of the game's FSR3 wrapper
@@ -172,6 +203,7 @@ namespace FSR4Bridge.Source
                 if (++_deviceLostRetries > 30)
                 {
                     _permaFail = true;
+                    DetachOpaqueCapture();   // stop paying the capture blit once we stop rendering
                     Plugin.MyLog.LogWarning("[FSR4] D3D12 device kept getting lost — falling back to in-engine FSR3 for this session.");
                     DrainLog();
                     return false;
@@ -183,6 +215,7 @@ namespace FSR4Bridge.Source
                 if (st >= 2)
                 {
                     _permaFail = true;
+                    DetachOpaqueCapture();   // stop paying the capture blit once we stop rendering
                     Plugin.MyLog.LogWarning($"[FSR4] native status {st} — falling back to in-engine FSR3 for this session.");
                     DrainLog();
                     return false;
@@ -191,6 +224,14 @@ namespace FSR4Bridge.Source
 
             bool vr = SptVrPresent;
             int eye = ((int)cam.stereoActiveEye) & 1;
+            _lastRenderEyeFrame = Time.frameCount;
+
+            // Non-OK status (init warmup, device-lost recovery): Unity may have recreated resources
+            // behind our cached native pointers — refetch them this frame. 0 on every normal frame.
+            bool ptrRefetch = st != 0;
+
+            bool dbg = Fsr4Config.DebugLog.Value;
+            if (dbg) _mainSw.Restart();
 
             // FSR needs render-res depth + motion, which Unity exposes as global textures once the
             // camera has the matching DepthTextureMode. Fetch the actual Texture objects (name-ref'd
@@ -209,17 +250,34 @@ namespace FSR4Bridge.Source
 
             // `source` is a pooled temp RT (ptr changes each frame) — copy into an owned RT so the
             // native shared-texture cache stays valid instead of rebuilding every frame.
-            EnsureCopyRT(ref _colorRT[eye],  renderW, renderH, source.format,             "FSR4Color" + eye);
-            EnsureCopyRT(ref _depthRT[eye],  renderW, renderH, RenderTextureFormat.RFloat, "FSR4Depth" + eye);
-            EnsureCopyRT(ref _motionRT[eye], renderW, renderH, RenderTextureFormat.RGHalf, "FSR4Motion" + eye);
-            UnityEngine.Graphics.Blit(source,    _colorRT[eye]);
+            EnsureCopyRT(ref _colorRT[eye],  ref _colorPtr[eye],  renderW, renderH, source.format,             "FSR4Color",  eye);
+            EnsureCopyRT(ref _depthRT[eye],  ref _depthPtr[eye],  renderW, renderH, RenderTextureFormat.RFloat, "FSR4Depth",  eye);
+            EnsureCopyRT(ref _motionRT[eye], ref _motionPtr[eye], renderW, renderH, RenderTextureFormat.RGHalf, "FSR4Motion", eye);
+            if (ptrRefetch)
+            {
+                _colorPtr[eye]  = _colorRT[eye].GetNativeTexturePtr();
+                _depthPtr[eye]  = _depthRT[eye].GetNativeTexturePtr();
+                _motionPtr[eye] = _motionRT[eye].GetNativeTexturePtr();
+            }
+
+            // Same-size same-format color goes through the copy engine (no fullscreen draw);
+            // depth/motion stay as Blits (they convert format to RFloat/RGHalf).
+            if (source.antiAliasing <= 1 && source.graphicsFormat == _colorRT[eye].graphicsFormat)
+                UnityEngine.Graphics.CopyTexture(source, _colorRT[eye]);
+            else
+                UnityEngine.Graphics.Blit(source, _colorRT[eye]);
             UnityEngine.Graphics.Blit(camDepth,  _depthRT[eye]);
             UnityEngine.Graphics.Blit(camMotion, _motionRT[eye]);
 
-            IntPtr colorPtr  = _colorRT[eye].GetNativeTexturePtr();
-            IntPtr outPtr    = destination.GetNativeTexturePtr();
-            IntPtr depthPtr  = _depthRT[eye].GetNativeTexturePtr();
-            IntPtr motionPtr = _motionRT[eye].GetNativeTexturePtr();
+            // destination is the game's persistent output RT — refetch only when its identity changes
+            // (a same-object in-place Release+Create would go stale, but no game path does that; any
+            // resulting native failure flips status non-OK, which forces a refetch next frame).
+            if (!ReferenceEquals(destination, _destRT[eye]) || ptrRefetch)
+            {
+                _destRT[eye]  = destination;
+                _destPtr[eye] = destination.GetNativeTexturePtr();
+            }
+            IntPtr colorPtr = _colorPtr[eye], outPtr = _destPtr[eye], depthPtr = _depthPtr[eye], motionPtr = _motionPtr[eye];
             if (colorPtr == IntPtr.Zero || outPtr == IntPtr.Zero || depthPtr == IntPtr.Zero || motionPtr == IntPtr.Zero)
                 return false;
 
@@ -274,6 +332,7 @@ namespace FSR4Bridge.Source
             if (IsHdrFormat(source.format))                  flags |= FSR4F_HDR;
             if (Fsr4Config.Upscaler.Value == EUpscaler.FSR4) flags |= FSR4F_PREFER_FSR4;
             if (Fsr4Config.MvJitterCancel.Value)             flags |= FSR4F_MV_JITTER_CANCEL;
+            if (Fsr4Config.ModelFix.Value)                   flags |= FSR4F_MODEL_FIX;
 
             // Reactive mask (flatscreen + VR). Capture the opaque-only color at BeforeForwardAlpha and hand
             // it to the native reactive-mask generator; the native no-ops if it's null. One capture RT is
@@ -283,7 +342,9 @@ namespace FSR4Bridge.Source
             if (Fsr4Config.ReactiveMask.Value)
             {
                 EnsureOpaqueCapture(cam, renderW, renderH, source.format);
-                opaquePtr = _opaqueRT.GetNativeTexturePtr();
+                if (ptrRefetch && _opaqueRT != null)
+                    _opaquePtr = _opaqueRT.GetNativeTexturePtr();
+                opaquePtr = _opaquePtr;
                 if (opaquePtr != IntPtr.Zero) flags |= FSR4F_REACTIVE;
             }
             else
@@ -301,14 +362,17 @@ namespace FSR4Bridge.Source
                 camNear, camFar, fovY,
                 dtMs, Mathf.Clamp01(Fsr4Config.Sharpness.Value), flags);
 
-            if (_cmd == null)
-                _cmd = new CommandBuffer { name = "FSR4Bridge" };
-            _cmd.Clear();
-            _cmd.IssuePluginEvent(_renderEventFunc, (slot << 1) | eye);
-            UnityEngine.Graphics.ExecuteCommandBuffer(_cmd);
+            int eventId = (slot << 1) | eye;
+            CommandBuffer cmd = _eventCmds[eventId];
+            if (cmd == null)
+            {
+                cmd = new CommandBuffer { name = "FSR4Bridge" };
+                cmd.IssuePluginEvent(_renderEventFunc, eventId);
+                _eventCmds[eventId] = cmd;
+            }
+            UnityEngine.Graphics.ExecuteCommandBuffer(cmd);
 
             // Debug Log toggles both the managed per-frame diagnostics AND the native per-texture spam.
-            bool dbg = Fsr4Config.DebugLog.Value;
             if (dbg != _prevDebugLog)
             {
                 if (dbg) _debugLogsLeft = 8;
@@ -328,10 +392,10 @@ namespace FSR4Bridge.Source
             DrainLog();
             if (!_loggedActiveProvider)
             {
-                var sb = new StringBuilder(128);
-                if (Fsr4GetActiveVersion(sb, sb.Capacity) > 0 && sb.Length > 0 && sb[0] != 'n')
+                int n = Fsr4GetActiveVersion(_logBuf, _logBuf.Length);
+                if (n > 0 && _logBuf[0] != (byte)'n')   // "none" until the first context creates
                 {
-                    _activeProviderStr = (Fsr4IsFsr4Active() == 1 ? "FSR4 " : "FSR ") + sb;
+                    _activeProviderStr = (Fsr4IsFsr4Active() == 1 ? "FSR4 " : "FSR ") + Encoding.UTF8.GetString(_logBuf, 0, n);
                     Plugin.MyLog.LogInfo($"[FSR4] active — {_activeProviderStr}");
                     _loggedActiveProvider = true;
                 }
@@ -345,6 +409,18 @@ namespace FSR4Bridge.Source
                 _lastRW = renderW; _lastRH = renderH; _lastOW = outW; _lastOH = outH;
                 _lastResLogTime = Time.realtimeSinceStartup;
                 Plugin.MyLog.LogInfo($"[FSR4] {_activeProviderStr}{(vr ? " (VR)" : "")} — render {renderW}x{renderH} -> {outW}x{outH}");
+            }
+
+            if (dbg)
+            {
+                _mainSw.Stop();
+                _mainAccumMs += _mainSw.Elapsed.TotalMilliseconds;
+                if (++_mainSamples >= 300)
+                {
+                    Plugin.MyLog.LogInfo($"[FSR4] main-thread RenderEye avg over {_mainSamples} calls: {_mainAccumMs / _mainSamples:F3} ms");
+                    _mainAccumMs = 0.0;
+                    _mainSamples = 0;
+                }
             }
             return true;
         }
@@ -374,7 +450,7 @@ namespace FSR4Bridge.Source
         {
             bool rebuilt = _opaqueRT == null || _opaqueRT.width != w || _opaqueRT.height != h
                         || _opaqueRT.format != fmt || !_opaqueRT.IsCreated();
-            EnsureCopyRT(ref _opaqueRT, w, h, fmt, "FSR4Opaque");
+            EnsureCopyRT(ref _opaqueRT, ref _opaquePtr, w, h, fmt, "FSR4Opaque", -1);
             if (_opaqueCmd == null)
                 _opaqueCmd = new CommandBuffer { name = "FSR4OpaqueCapture" };
             if (rebuilt || _opaqueCam != cam)
@@ -397,7 +473,7 @@ namespace FSR4Bridge.Source
             _opaqueCam = null;
         }
 
-        private static void EnsureCopyRT(ref RenderTexture rt, int w, int h, RenderTextureFormat fmt, string name)
+        private static void EnsureCopyRT(ref RenderTexture rt, ref IntPtr ptr, int w, int h, RenderTextureFormat fmt, string baseName, int eye)
         {
             if (rt != null && rt.width == w && rt.height == h && rt.format == fmt && rt.IsCreated())
                 return;
@@ -408,13 +484,14 @@ namespace FSR4Bridge.Source
             }
             rt = new RenderTexture(w, h, 0, fmt, RenderTextureReadWrite.Linear)
             {
-                name = name,
+                name = eye >= 0 ? baseName + eye : baseName,
                 filterMode = FilterMode.Point,
                 useMipMap = false,
                 autoGenerateMips = false,
                 anisoLevel = 0,
             };
             rt.Create();
+            ptr = rt.GetNativeTexturePtr();   // the one render-thread sync, at (re)create only
         }
 
         private static bool IsHdrFormat(RenderTextureFormat fmt)
@@ -430,14 +507,17 @@ namespace FSR4Bridge.Source
             try { return Fsr4GetStatus(); } catch { return 1; }
         }
 
+        // Reused buffer: this runs every frame, and the old per-call StringBuilder(1024) + its
+        // marshaling copies were steady Mono GC churn even with zero pending lines.
+        private static readonly byte[] _logBuf = new byte[1024];
+
         private static void DrainLog()
         {
             try
             {
-                var sb = new StringBuilder(1024);
-                int guard = 0;
-                while (Fsr4PopLogLine(sb, sb.Capacity) > 0 && guard++ < 64)
-                    Plugin.MyLog.LogInfo(sb.ToString());
+                int n, guard = 0;
+                while ((n = Fsr4PopLogLine(_logBuf, _logBuf.Length)) > 0 && guard++ < 64)
+                    Plugin.MyLog.LogInfo(Encoding.UTF8.GetString(_logBuf, 0, n));
             }
             catch { }
         }

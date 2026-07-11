@@ -7,7 +7,7 @@ using FSR4Bridge.Source;
 namespace FSR4Bridge
 {
     [BepInDependency("com.matsix.sptvr", BepInDependency.DependencyFlags.SoftDependency)]
-    [BepInPlugin("com.matsix.fsr4bridge", "FSR4 Bridge", "1.0.1")]
+    [BepInPlugin("com.matsix.fsr4bridge", "FSR4 Bridge", "1.0.2")]
     public class Plugin : BaseUnityPlugin
     {
         public static ManualLogSource MyLog;
@@ -36,6 +36,13 @@ namespace FSR4Bridge
             Fsr4Config.NativeAA.SettingChanged += (_, __) => Fsr4NativeAAPatch.ReapplyOnToggle();
 
             MyLog.LogInfo("FSR4Bridge loaded — select an FSR mode in Graphics settings and toggle 'Enable FSR4' in the config.");
+        }
+
+        // Detaches the opaque-capture CommandBuffer when the bridge stops rendering (FSR off in game
+        // settings, perma-fail, menus)
+        private void Update()
+        {
+            Fsr4Bridge.IdleTick();
         }
     }
 }

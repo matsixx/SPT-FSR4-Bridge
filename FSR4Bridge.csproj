@@ -6,7 +6,7 @@
     <RootNamespace>FSR4Bridge</RootNamespace>
     <Nullable>disable</Nullable>
     <Authors>matsix</Authors>
-    <AssemblyVersion>1.0.1</AssemblyVersion>
+    <AssemblyVersion>1.0.2</AssemblyVersion>
     <FileVersion>$(AssemblyVersion)</FileVersion>
     <Version>$(AssemblyVersion)</Version>
     <LangVersion>latest</LangVersion>

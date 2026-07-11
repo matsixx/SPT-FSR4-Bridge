@@ -20,6 +20,7 @@ namespace FSR4Bridge.Source
         public static ConfigEntry<bool>      DepthInfinite;
         public static ConfigEntry<bool>      ReactiveMask;
         public static ConfigEntry<bool>      NativeAA;
+        public static ConfigEntry<bool>      ModelFix;
 
         public static ConfigEntry<bool>      DebugLog;
         public static ConfigEntry<bool>      VrUseGameJitter;
@@ -54,6 +55,10 @@ namespace FSR4Bridge.Source
 
             Upscaler = config.Bind("FSR4", "Upscaler", EUpscaler.FSR4,
                 Ordered("Choose which upscaler you would like to use, 3.1.x will use your current default in Adrenalin.", 4));
+
+            ModelFix = config.Bind("FSR4", "FSR4 Model Stability Fix", true,
+                Ordered("Forces FSR4's stable ML model at Quality-range ratios (1.29x+), where the driver's own model " +
+                    "selection is unstable and makes edges wobble/shimmer. No effect on FSR 3.1.x or at native ratios.", 5));
 
             Enabled = config.Bind("FSR4", "Enable FSR4", true,
                 Ordered("Enables FSR4, if this is disabled, the game will switch back to base FSR3.0", 3));
