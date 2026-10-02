@@ -7,7 +7,7 @@ using FSR4Bridge.Source;
 namespace FSR4Bridge
 {
     [BepInDependency("com.matsix.sptvr", BepInDependency.DependencyFlags.SoftDependency)]
-    [BepInPlugin("com.matsix.fsr4bridge", "FSR4 Bridge", "1.0.2")]
+    [BepInPlugin("com.matsix.fsr4bridge", "FSR4 Bridge", "1.1.0")]
     public class Plugin : BaseUnityPlugin
     {
         public static ManualLogSource MyLog;
@@ -22,6 +22,7 @@ namespace FSR4Bridge
                 MyLog.LogInfo("FSR4Bridge: SPT-VR detected — driving VR FSR4 as well as flatscreen.");
 
             new Fsr4RenderPatch().Enable();
+            new Fsr4AfterTransparentPatch().Enable();
             new Fsr4NativeAAPatch().Enable();
 
             // Free the FFX contexts + VRAM when the user turns FSR4 off mid-session (they lazily

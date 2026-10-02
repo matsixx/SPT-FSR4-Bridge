@@ -20,13 +20,12 @@ namespace FSR4Bridge.Source
         public static ConfigEntry<bool>      DepthInfinite;
         public static ConfigEntry<bool>      ReactiveMask;
         public static ConfigEntry<bool>      NativeAA;
-        public static ConfigEntry<bool>      ModelFix;
 
         public static ConfigEntry<bool>      DebugLog;
         public static ConfigEntry<bool>      VrUseGameJitter;
         public static ConfigEntry<bool>      MvJitterCancel;
-        public static ConfigEntry<bool>      VrFlipJitterX;
-        public static ConfigEntry<bool>      VrFlipJitterY;
+        public static ConfigEntry<bool>      FlipJitterX;
+        public static ConfigEntry<bool>      FlipJitterY;
 
         private static ConfigDescription Ordered(string desc, int order, AcceptableValueBase range = null)
         {
@@ -55,10 +54,6 @@ namespace FSR4Bridge.Source
 
             Upscaler = config.Bind("FSR4", "Upscaler", EUpscaler.FSR4,
                 Ordered("Choose which upscaler you would like to use, 3.1.x will use your current default in Adrenalin.", 4));
-
-            ModelFix = config.Bind("FSR4", "FSR4 Model Stability Fix", true,
-                Ordered("Forces FSR4's stable ML model at Quality-range ratios (1.29x+), where the driver's own model " +
-                    "selection is unstable and makes edges wobble/shimmer. No effect on FSR 3.1.x or at native ratios.", 5));
 
             Enabled = config.Bind("FSR4", "Enable FSR4", true,
                 Ordered("Enables FSR4, if this is disabled, the game will switch back to base FSR3.0", 3));
@@ -90,11 +85,13 @@ namespace FSR4Bridge.Source
             MvJitterCancel = config.Bind("Debug", "MV Jitter Cancellation", false,
                 Advanced("Experiment: tell FSR the motion vectors already contain the jitter (it subtracts it). "));
 
-            VrFlipJitterX = config.Bind("Debug", "VR Only - Jitter Flip X", false,
-                Advanced("Flips jitter on the X axis"));
+            // New key names: the old "VR Only" flips used a different base convention, so their saved values
+            // must not carry over.
+            FlipJitterX = config.Bind("Debug", "Jitter Flip X", false,
+                Advanced("Flips the jitter fed to FSR on the X axis (off = the game's own FSR3 convention)"));
 
-            VrFlipJitterY = config.Bind("Debug", "VR Only - Jitter Flip Y", true,
-                Advanced("Flips jitter on the Y axis"));
+            FlipJitterY = config.Bind("Debug", "Jitter Flip Y", false,
+                Advanced("Flips the jitter fed to FSR on the Y axis (off = the game's own FSR3 convention)"));
         }
     }
 }

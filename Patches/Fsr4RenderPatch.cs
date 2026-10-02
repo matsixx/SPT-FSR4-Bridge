@@ -36,7 +36,10 @@ namespace FSR4Bridge.Patches
                     _lastImpl = __instance;
                     _lastCam  = __instance.GetComponent<Camera>();
                 }
-                if (Fsr4Bridge.RenderEye(source, destination, _lastCam))
+                // Same scope test the game passes to its FSR3 wrapper (drives the reactive threshold).
+                bool opticOrCollimator = __instance.OpticLensRenderer != null || __instance.CollimatorRenderer != null;
+                if (Fsr4Bridge.RenderEye(source, destination, _lastCam, externalCommandBuffer, opticOrCollimator,
+                                         Fsr4AfterTransparentPatch.Get(__instance)))
                 {
                     __result = true;
                     return false;

@@ -31,19 +31,19 @@
 
   <ItemGroup>
     <Reference Include="0Harmony">
-      <HintPath>F:\SPT4.0\BepInEx\core\0Harmony.dll</HintPath>
+      <HintPath>F:\SPT4.1\BepInEx\core\0Harmony.dll</HintPath>
       <Private>false</Private>
     </Reference>
     <Reference Include="BepInEx">
-      <HintPath>F:\SPT4.0\BepInEx\core\BepInEx.dll</HintPath>
+      <HintPath>F:\SPT4.1\BepInEx\core\BepInEx.dll</HintPath>
       <Private>false</Private>
     </Reference>
     <Reference Include="spt-reflection">
-      <HintPath>F:\SPT4.0\BepInEx\plugins\spt\spt-reflection.dll</HintPath>
+      <HintPath>F:\SPT4.1\BepInEx\plugins\spt\spt-reflection.dll</HintPath>
       <Private>false</Private>
     </Reference>
     <Reference Include="spt-common">
-      <HintPath>F:\SPT4.0\BepInEx\plugins\spt\spt-common.dll</HintPath>
+      <HintPath>F:\SPT4.1\BepInEx\plugins\spt\spt-common.dll</HintPath>
       <Private>false</Private>
     </Reference>
     <!-- Publicized copy (compile-time only) so we can read SSAAImpl / TemporalAntialiasing internals.
@@ -53,11 +53,11 @@
       <Private>false</Private>
     </Reference>
     <Reference Include="UnityEngine">
-      <HintPath>F:\SPT4.0\EscapeFromTarkov_Data\Managed\UnityEngine.dll</HintPath>
+      <HintPath>F:\SPT4.1\EscapeFromTarkov_Data\Managed\UnityEngine.dll</HintPath>
       <Private>false</Private>
     </Reference>
     <Reference Include="UnityEngine.CoreModule">
-      <HintPath>F:\SPT4.0\EscapeFromTarkov_Data\Managed\UnityEngine.CoreModule.dll</HintPath>
+      <HintPath>F:\SPT4.1\EscapeFromTarkov_Data\Managed\UnityEngine.CoreModule.dll</HintPath>
       <Private>false</Private>
     </Reference>
     <!-- Publicized SPT-VR (compile-time only, soft dependency) for typed access to VRJitterComponent
@@ -72,20 +72,20 @@
   <!-- Auto-deploy: every build copies the managed DLL + the native bridge + AMD runtime straight into
        the game, so the game always runs whatever was built last. Skipped when the game folder is
        absent (e.g. building on another machine). -->
-  <Target Name="DeployToGame" AfterTargets="Build" Condition="Exists('F:\SPT4.0\BepInEx\plugins')">
-    <MakeDir Directories="F:\SPT4.0\BepInEx\plugins\FSR4Bridge\native\D3D12" />
-    <Copy SourceFiles="$(TargetPath)" DestinationFolder="F:\SPT4.0\BepInEx\plugins\FSR4Bridge" />
+  <Target Name="DeployToGame" AfterTargets="Build" Condition="Exists('F:\SPT4.1\BepInEx\plugins')">
+    <MakeDir Directories="F:\SPT4.1\BepInEx\plugins\FSR4Bridge\native\D3D12" />
+    <Copy SourceFiles="$(TargetPath)" DestinationFolder="F:\SPT4.1\BepInEx\plugins\FSR4Bridge" />
     <Copy SourceFiles="native\build\FSR4Native.dll"
-          DestinationFolder="F:\SPT4.0\BepInEx\plugins\FSR4Bridge\native"
+          DestinationFolder="F:\SPT4.1\BepInEx\plugins\FSR4Bridge\native"
           Condition="Exists('native\build\FSR4Native.dll')" />
     <Copy SourceFiles="native\runtime\amd_fidelityfx_loader_dx12.dll;native\runtime\amd_fidelityfx_upscaler_dx12.dll;native\runtime\dxil.dll"
-          DestinationFolder="F:\SPT4.0\BepInEx\plugins\FSR4Bridge\native"
+          DestinationFolder="F:\SPT4.1\BepInEx\plugins\FSR4Bridge\native"
           Condition="Exists('native\runtime\amd_fidelityfx_loader_dx12.dll')" />
     <!-- Agility SDK runtime (D3D12Core.dll) in its own subfolder — FSR4 4.1.1 needs SM 6.6 from it. -->
     <Copy SourceFiles="native\runtime\D3D12\D3D12Core.dll"
-          DestinationFolder="F:\SPT4.0\BepInEx\plugins\FSR4Bridge\native\D3D12"
+          DestinationFolder="F:\SPT4.1\BepInEx\plugins\FSR4Bridge\native\D3D12"
           Condition="Exists('native\runtime\D3D12\D3D12Core.dll')" />
-    <Message Importance="high" Text="==&gt; FSR4 Bridge deployed to F:\SPT4.0\BepInEx\plugins\FSR4Bridge" />
+    <Message Importance="high" Text="==&gt; FSR4 Bridge deployed to F:\SPT4.1\BepInEx\plugins\FSR4Bridge" />
   </Target>
 
 </Project>

@@ -71,8 +71,14 @@ enum Fsr4Flags : int
     FSR4F_RESET           = 1 << 7,  // per-frame history reset request
     FSR4F_MV_JITTER_CANCEL = 1 << 8, // motion vectors have the jitter baked in (FSR removes it)
     FSR4F_REACTIVE        = 1 << 9,  // opaque-only color supplied → auto-generate + feed a reactive mask
-    FSR4F_MODEL_FIX       = 1 << 10, // force the stable FSR4 ML model at Quality-range ratios (createModel hook)
+    FSR4F_MODEL_FIX       = 1 << 10, // force the ratio-appropriate FSR4 ML model (createModel hook)
+    FSR4F_OPTIC           = 1 << 11, // optic/collimator on screen → lower reactive threshold (vanilla FSR3 does this)
 };
+
+// Flags that only affect a single dispatch, never the ffx context. The stored eye.ctxFlags and the
+// needCtxRebuild comparison MUST both mask exactly this set — a bit masked in one place but not the other
+// makes them never match while it's set = context rebuild every frame.
+static const int kPerDispatchFlags = FSR4F_RESET | FSR4F_REACTIVE | FSR4F_OPTIC;
 
 // ---------------------------------------------------------------- logging (drained by C# into BepInEx log)
 static std::mutex             gLogMutex;
@@ -180,16 +186,17 @@ static void SafeFfxDestroyContext(ffxContext* ctx)
 
 // ---------------------------------------------------------------------------------------------------
 // FSR4 model-selection fix.
-// The FSR4 provider ships multiple ML models and picks one from a quality "preset". At Quality-range
-// ratios (>= ~1.29x) preset 0's selection is unstable — the reconstruction oscillates frame to frame
-// and edges wobble as if the jitter were misaligned (confirmed in VR: the wobble vanishes under the
-// FSR 3.1 provider and at 1.0x ratio). The public ffx-api doesn't expose model selection, so we
-// detour the provider's internal createModel(context, preset, model) — located by signature in
-// amdxcffx64 2.3.0 / amd_fidelityfx_upscaler_dx12 4.1.1 (the versions we target) — and bump
-// preset 0 -> 1 (the stable model) while the current ratio is in the bad window. Technique per
-// OptiScaler's FSR4ModelSelection; implementation is our own. All createModel calls originate on the
-// render thread inside our SafeFfx* SEH scopes, and hooks install on that same thread before the
-// context exists, so there's no concurrent-patch or unguarded-crash window.
+// The FSR4 provider ships one ML model per quality "preset": 0 NativeAA, 1 Quality/Ultra Quality,
+// 2 Balanced, 3 Performance, 4 DRS (dynamic resolution), 5 Ultra Performance (OptiScaler's mapping).
+// Two selections are wrong for us: a context created with FFX_UPSCALE_ENABLE_DYNAMIC_RESOLUTION always
+// gets the generalist DRS model (logged as "preset 4" at a 1.5x ratio), and Quality-range ratios
+// (>= ~1.29x) sometimes get the NativeAA model, which wobbles. The public ffx-api doesn't expose model
+// selection, so we detour the provider's internal createModel(context, preset, model) — located by
+// signature in amdxcffx64 2.3.0 / amd_fidelityfx_upscaler_dx12 4.1.1 (the versions we target) — and
+// replace those presets with the one matching the actual upscale ratio. Technique per OptiScaler's
+// FSR4ModelSelection; implementation is our own. All createModel calls originate on the render thread
+// inside our SafeFfx* SEH scopes, and hooks install on that same thread before the context exists, so
+// there's no concurrent-patch or unguarded-crash window.
 
 typedef uint64_t (*PfnCreateModel2)(void* context, uint32_t preset, void** model);
 
@@ -251,12 +258,23 @@ static uint8_t* FindPattern(HMODULE mod, const char* pattern)
     return nullptr;
 }
 
+// Preset for a per-dimension upscale ratio; boundaries sit between the documented ratios
+// (Quality 1.5, Balanced 1.7, Performance 2.0, Ultra Performance 3.0). 1.29 is OptiScaler's NativeAA cutoff.
+static uint32_t PresetForRatio(float ratio)
+{
+    if (ratio < 1.29f) return 0;
+    if (ratio < 1.6f)  return 1;
+    if (ratio < 1.85f) return 2;
+    if (ratio < 2.5f)  return 3;
+    return 5;
+}
+
 static uint32_t CorrectModelPreset(uint32_t preset)
 {
     uint32_t corrected = preset;
-    if (gModelFixEnabled.load(std::memory_order_relaxed) && preset == 0 &&
-        gModelFixRatio.load(std::memory_order_relaxed) >= 1.29f)
-        corrected = 1;
+    float ratio = gModelFixRatio.load(std::memory_order_relaxed);
+    if (gModelFixEnabled.load(std::memory_order_relaxed) && (preset == 4 || (preset == 0 && ratio >= 1.29f)))
+        corrected = PresetForRatio(ratio);
     gModelPresetSeen.store(preset, std::memory_order_relaxed);
     gModelPresetUsed.store(corrected, std::memory_order_relaxed);
     return corrected;
@@ -380,6 +398,7 @@ struct FrameParams
     void* mvecTex;
     void* outTex;
     void* opaqueTex;   // opaque-only color (pre-transparency) for reactive-mask generation; null = disabled
+    void* afterAlphaTex; // color right after forward transparents (reactive-mask comparison); null = use colorTex
     int   renderW, renderH;
     int   outW, outH;
     float jitterX, jitterY;
@@ -398,12 +417,13 @@ struct Eye
     FrameParams paramSlots[PARAM_SLOTS] = {};
     std::mutex  paramMutex;
 
-    SharedTex color, depth, mvec, output, opaque;
+    SharedTex color, depth, mvec, output, opaque, afterAlpha;
     ComPtr<ID3D12Resource> reactiveMask;   // D3D12-internal (not shared) UAV target for the reactive mask
     UINT reactiveW = 0, reactiveH = 0;
 
     ffxContext ctx = nullptr;
     UINT ctxOutW = 0, ctxOutH = 0;
+    UINT ctxRenderW = 0, ctxRenderH = 0;
     int  ctxFlags = -1;
     bool firstDispatch = true;
 
@@ -434,6 +454,7 @@ static void ReleaseEyeResources(Eye& eye)
     eye.mvec   = SharedTex{};
     eye.output = SharedTex{};
     eye.opaque = SharedTex{};
+    eye.afterAlpha = SharedTex{};
     eye.reactiveMask.Reset();
     eye.reactiveW = eye.reactiveH = 0;
 }
@@ -779,7 +800,7 @@ static uint64_t ResolveProviderVersionId(bool preferFsr4)
     return gVersionId3x;   // force the 3.1.x provider (0 → ffx default only if no 3.x enumerated)
 }
 
-static bool CreateEyeContext(Eye& eye, UINT outW, UINT outH, int flags)
+static bool CreateEyeContext(Eye& eye, UINT renderW, UINT renderH, UINT outW, UINT outH, int flags)
 {
     DestroyEyeContext(eye);
 
@@ -795,13 +816,15 @@ static bool CreateEyeContext(Eye& eye, UINT outW, UINT outH, int flags)
     if (flags & FSR4F_DYNAMIC_RES)    ffxFlags |= FFX_UPSCALE_ENABLE_DYNAMIC_RESOLUTION;
     if (flags & FSR4F_MV_JITTER_CANCEL) ffxFlags |= FFX_UPSCALE_ENABLE_MOTION_VECTORS_JITTER_CANCELLATION;
 
-    // maxRenderSize = output size: with dynamic resolution on, any render res up to the output
-    // res works without recreating the context — quality-preset changes and transient renderer
-    // refreshes (SteamVR dashboard!) then never pay the FSR4 model-reload hitch.
+    // Dynamic resolution (VR): maxRenderSize = output, so any render res up to the output works without
+    // recreating the context — transient renderer refreshes (SteamVR dashboard!) never pay the FSR4
+    // model-reload hitch. Without it (flatscreen) the context is sized to the real render res and rebuilt
+    // when that changes, which only happens on a quality change.
+    bool dynamicRes = (flags & FSR4F_DYNAMIC_RES) != 0;
     ffxCreateContextDescUpscale desc = {};
     desc.header.type    = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;
     desc.flags          = ffxFlags;
-    desc.maxRenderSize  = {outW, outH};
+    desc.maxRenderSize  = dynamicRes ? FfxApiDimensions2D{outW, outH} : FfxApiDimensions2D{renderW, renderH};
     desc.maxUpscaleSize = {outW, outH};
     desc.fpMessage      = &FfxMessageCallback;
 
@@ -887,10 +910,9 @@ static bool CreateEyeContext(Eye& eye, UINT outW, UINT outH, int flags)
 
     eye.ctxOutW = outW;
     eye.ctxOutH = outH;
-    // MUST match the needCtxRebuild comparison mask (DoRenderEvent) exactly — FSR4F_REACTIVE is per-dispatch,
-    // not a context flag. If this stored value keeps a bit the comparison drops, they never match while that
-    // bit is set → the context rebuilds EVERY FRAME (catastrophic perf).
-    eye.ctxFlags = flags & ~(FSR4F_RESET | FSR4F_REACTIVE);
+    eye.ctxRenderW = renderW;
+    eye.ctxRenderH = renderH;
+    eye.ctxFlags = flags & ~kPerDispatchFlags;   // same mask as the needCtxRebuild comparison
     eye.firstDispatch = true;
     return true;
 }
@@ -1046,12 +1068,16 @@ static void DoRenderEvent(int eventId)
         return;
     }
 
-    // Optional opaque-only color for reactive-mask generation. Failure here just disables reactive for
-    // the frame — never fails the upscale.
-    ComPtr<ID3D11Texture2D> opaqueTex;
+    // Optional opaque-only + after-transparency color for reactive-mask generation. Failure here just
+    // disables reactive for the frame — never fails the upscale.
+    ComPtr<ID3D11Texture2D> opaqueTex, afterAlphaTex;
     bool wantReactive = (p.flags & FSR4F_REACTIVE) && p.opaqueTex != nullptr;
     if (wantReactive)
+    {
         ((IUnknown*)p.opaqueTex)->QueryInterface(IID_PPV_ARGS(&opaqueTex));
+        if (p.afterAlphaTex)
+            ((IUnknown*)p.afterAlphaTex)->QueryInterface(IID_PPV_ARGS(&afterAlphaTex));
+    }
 
     if (!EnsureDevices(colorTex.Get()))
         return;
@@ -1066,19 +1092,20 @@ static void DoRenderEvent(int eventId)
     gModelFixRatio.store(p.renderW > 0 ? (float)p.outW / (float)p.renderW : 1.0f, std::memory_order_relaxed);
     LogModelPresetIfChanged();
 
-    // FSR4F_REACTIVE is a PER-DISPATCH flag (whether we feed a reactive mask), NOT an ffx context flag —
-    // excluding it (like FSR4F_RESET) means toggling the Reactive Mask config no longer needlessly tears
-    // down + rebuilds the context. That rebuild was the driver crash: destroying the context mid-flight is
-    // an AMD TDR (DEVICE_HUNG 0x887A0006).
-    int ctxFlags = p.flags & ~(FSR4F_RESET | FSR4F_REACTIVE);
-    bool needCtxRebuild = !e.ctx || e.ctxOutW != (UINT)p.outW || e.ctxOutH != (UINT)p.outH || e.ctxFlags != ctxFlags;
+    // Per-dispatch flags (reactive, optic, reset) never rebuild the context — a needless rebuild destroyed
+    // the context mid-flight, which is an AMD TDR (DEVICE_HUNG 0x887A0006).
+    int ctxFlags = p.flags & ~kPerDispatchFlags;
+    bool renderSizeChanged = e.ctx && ((UINT)p.renderW != e.ctxRenderW || (UINT)p.renderH != e.ctxRenderH);
+    bool needCtxRebuild = !e.ctx || e.ctxOutW != (UINT)p.outW || e.ctxOutH != (UINT)p.outH || e.ctxFlags != ctxFlags
+                       || (renderSizeChanged && !(ctxFlags & FSR4F_DYNAMIC_RES));   // fixed-size context
+    if (e.ctx && needCtxRebuild)
+        Log("[FSR4] eye %d context rebuild: render %dx%d -> out %dx%d", eye, p.renderW, p.renderH, p.outW, p.outH);
 
     // Idle the GPU before tearing down / recreating any shared texture OR the context — freeing a resource
-    // the GPU is still using is a TDR. Fires on a resolution change AND on any context rebuild (a flags
-    // change that maps to an ffx context flag), but only when something actually changes, so it's free on
-    // normal frames. (Previously it only covered resize, which is why the flags-change rebuild crashed.)
-    bool sizeChanged = e.ctx && ((UINT)p.outW != e.ctxOutW || (UINT)p.outH != e.ctxOutH
-                                 || (e.color.tex11 && (UINT)p.renderW != e.color.width));
+    // the GPU is still using is a TDR. Fires on a resolution change AND on any context rebuild, but only
+    // when something actually changes, so it's free on normal frames.
+    bool sizeChanged = e.ctx && ((UINT)p.outW != e.ctxOutW || (UINT)p.outH != e.ctxOutH || renderSizeChanged
+                                 || (e.color.tex11 && ((UINT)p.renderW != e.color.width || (UINT)p.renderH != e.color.height)));
     if (e.ctx && (sizeChanged || needCtxRebuild))
         WaitQueueIdle();
 
@@ -1096,18 +1123,22 @@ static void DoRenderEvent(int eventId)
 
     if (needCtxRebuild)
     {
-        if (!CreateEyeContext(e, p.outW, p.outH, p.flags))
+        if (!CreateEyeContext(e, p.renderW, p.renderH, p.outW, p.outH, p.flags))
             return;
     }
 
     // Reactive-mask inputs (opaque-only color + the internal mask target). Any failure just disables
-    // reactive for this frame — the upscale below still runs.
+    // reactive for this frame — the upscale below still runs. The after-transparency capture is optional:
+    // without it the mask compares against the final input color instead.
+    bool useAfterAlpha = false;
     if (wantReactive)
     {
         if (!opaqueTex ||
             !EnsureSharedTex(e.opaque, opaqueTex.Get(), false, "opaque") ||
             !EnsureReactiveMask(e, (UINT)p.renderW, (UINT)p.renderH))
             wantReactive = false;
+        else
+            useAfterAlpha = afterAlphaTex && EnsureSharedTex(e.afterAlpha, afterAlphaTex.Get(), false, "afterAlpha");
     }
 
     if (prof) { double n = NowMs(); tSetup = n - tPrev; tPrev = n; }
@@ -1118,6 +1149,8 @@ static void DoRenderEvent(int eventId)
     gCtx11->CopyResource(e.mvec.tex11.Get(), mvecTex.Get());
     if (wantReactive)
         gCtx11->CopyResource(e.opaque.tex11.Get(), opaqueTex.Get());
+    if (useAfterAlpha)
+        gCtx11->CopyResource(e.afterAlpha.tex11.Get(), afterAlphaTex.Get());
 
     if (prof) { double n = NowMs(); tCopies = n - tPrev; tPrev = n; }
 
@@ -1141,9 +1174,11 @@ static void DoRenderEvent(int eventId)
     e.alloc[ai]->Reset();
     e.cmdList->Reset(e.alloc[ai].Get(), nullptr);
 
-    // Generate the reactive mask FIRST (opaque-only vs full color → where translucency/particles changed),
-    // recorded onto the same command list so it runs right before the upscale reads it. FFX barriers the
-    // mask back to COMMON at the end of this dispatch, so the upscale below reads it consistently.
+    // Generate the reactive mask FIRST (opaque-only vs after-transparency color → where translucency/particles
+    // changed), recorded onto the same command list so it runs right before the upscale reads it. FFX barriers
+    // the mask back to COMMON at the end of this dispatch, so the upscale below reads it consistently.
+    // Parameters mirror the game's FSR3Wrapper: tonemap before comparing (HDR differences otherwise saturate
+    // the mask), and a lower threshold while a scope/collimator is up.
     bool reactiveReady = false;
     if (wantReactive)
     {
@@ -1151,13 +1186,14 @@ static void DoRenderEvent(int eventId)
         gr.header.type     = FFX_API_DISPATCH_DESC_TYPE_UPSCALE_GENERATEREACTIVEMASK;
         gr.commandList     = e.cmdList.Get();
         gr.colorOpaqueOnly = ffxApiGetResourceDX12(e.opaque.res12.Get(),      FFX_API_RESOURCE_STATE_COMMON);
-        gr.colorPreUpscale = ffxApiGetResourceDX12(e.color.res12.Get(),       FFX_API_RESOURCE_STATE_COMMON);
+        gr.colorPreUpscale = ffxApiGetResourceDX12((useAfterAlpha ? e.afterAlpha : e.color).res12.Get(), FFX_API_RESOURCE_STATE_COMMON);
         gr.outReactive     = ffxApiGetResourceDX12(e.reactiveMask.Get(),      FFX_API_RESOURCE_STATE_COMMON);
         gr.renderSize      = {(uint32_t)p.renderW, (uint32_t)p.renderH};
         gr.scale           = 1.0f;
-        gr.cutoffThreshold = 0.2f;
+        gr.cutoffThreshold = (p.flags & FSR4F_OPTIC) ? 0.05f : 0.2f;
         gr.binaryValue     = 0.9f;
-        gr.flags           = FFX_UPSCALE_AUTOREACTIVEFLAGS_APPLY_THRESHOLD | FFX_UPSCALE_AUTOREACTIVEFLAGS_USE_COMPONENTS_MAX;
+        gr.flags           = FFX_UPSCALE_AUTOREACTIVEFLAGS_APPLY_TONEMAP | FFX_UPSCALE_AUTOREACTIVEFLAGS_APPLY_THRESHOLD
+                           | FFX_UPSCALE_AUTOREACTIVEFLAGS_USE_COMPONENTS_MAX;
         ffxReturnCode_t grc = SafeFfxDispatch(&e.ctx, &gr.header);
         reactiveReady = (grc == FFX_API_RETURN_OK);
         if (!reactiveReady)
@@ -1289,7 +1325,7 @@ FSR4_EXPORT int Fsr4Preflight(void* anyUnityTexture, int flags)
         return gStatus.load();
 
     Eye probe;
-    if (!CreateEyeContext(probe, 128, 128, flags))
+    if (!CreateEyeContext(probe, 128, 128, 128, 128, flags))
         return gStatus.load();
     DestroyEyeContext(probe);
     gStatus = FSR4_OK;
@@ -1299,7 +1335,7 @@ FSR4_EXPORT int Fsr4Preflight(void* anyUnityTexture, int flags)
 
 FSR4_EXPORT void Fsr4SetEyeFrameParams(
     int eye, int slot,
-    void* colorTex, void* depthTex, void* mvecTex, void* outTex, void* opaqueTex,
+    void* colorTex, void* depthTex, void* mvecTex, void* outTex, void* opaqueTex, void* afterAlphaTex,
     int renderW, int renderH, int outW, int outH,
     float jitterX, float jitterY, float mvScaleX, float mvScaleY,
     float camNear, float camFar, float fovY,
@@ -1309,7 +1345,8 @@ FSR4_EXPORT void Fsr4SetEyeFrameParams(
         return;
     Eye& e = gEyes[eye];
     FrameParams p;
-    p.colorTex = colorTex; p.depthTex = depthTex; p.mvecTex = mvecTex; p.outTex = outTex; p.opaqueTex = opaqueTex;
+    p.colorTex = colorTex; p.depthTex = depthTex; p.mvecTex = mvecTex; p.outTex = outTex;
+    p.opaqueTex = opaqueTex; p.afterAlphaTex = afterAlphaTex;
     p.renderW = renderW; p.renderH = renderH; p.outW = outW; p.outH = outH;
     p.jitterX = jitterX; p.jitterY = jitterY; p.mvScaleX = mvScaleX; p.mvScaleY = mvScaleY;
     p.camNear = camNear; p.camFar = camFar; p.fovY = fovY;
